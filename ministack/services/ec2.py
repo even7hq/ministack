@@ -1819,6 +1819,7 @@ def _authorize_sg_ingress(p):
             rule_items += _sg_rule_xml(sg_id, r, is_egress=False)
         else:
             rule_items += _sg_rule_xml(sg_id, existing, is_egress=False)
+    _vm_refresh_security_group(sg_id)
     return _xml(200, "AuthorizeSecurityGroupIngressResponse",
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
@@ -1862,6 +1863,7 @@ def _revoke_sg_ingress(p):
             return err
         revoked_items = "".join(
             _revoked_sg_rule_xml(sg_id, r, is_egress=False) for r in revoked)
+        _vm_refresh_security_group(sg_id)
         return _xml(200, "RevokeSecurityGroupIngressResponse",
                     f"<return>true</return><revokedSecurityGroupRuleSet>{revoked_items}</revokedSecurityGroupRuleSet>")
     rules = _parse_ip_permissions(p, "IpPermissions")
@@ -1870,6 +1872,7 @@ def _revoke_sg_ingress(p):
             if _rules_match(r, existing):
                 _tags.pop(_sg_rule_id(sg_id, False, existing), None)
         sg["IpPermissions"] = [e for e in sg["IpPermissions"] if not _rules_match(r, e)]
+    _vm_refresh_security_group(sg_id)
     return _xml(200, "RevokeSecurityGroupIngressResponse", "<return>true</return>")
 
 
@@ -1894,6 +1897,7 @@ def _authorize_sg_egress(p):
             rule_items += _sg_rule_xml(sg_id, r, is_egress=True)
         else:
             rule_items += _sg_rule_xml(sg_id, existing, is_egress=True)
+    _vm_refresh_security_group(sg_id)
     return _xml(200, "AuthorizeSecurityGroupEgressResponse",
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
@@ -1910,6 +1914,7 @@ def _revoke_sg_egress(p):
             return err
         revoked_items = "".join(
             _revoked_sg_rule_xml(sg_id, r, is_egress=True) for r in revoked)
+        _vm_refresh_security_group(sg_id)
         return _xml(200, "RevokeSecurityGroupEgressResponse",
                     f"<return>true</return><revokedSecurityGroupRuleSet>{revoked_items}</revokedSecurityGroupRuleSet>")
     rules = _parse_ip_permissions(p, "IpPermissions")
@@ -1922,6 +1927,7 @@ def _revoke_sg_egress(p):
         else:
             remaining.append(existing)
     sg["IpPermissionsEgress"] = remaining
+    _vm_refresh_security_group(sg_id)
     return _xml(200, "RevokeSecurityGroupEgressResponse",
                 f"<return>true</return><revokedSecurityGroupRuleSet>{revoked_items}</revokedSecurityGroupRuleSet>")
 
@@ -2301,12 +2307,47 @@ def _vm_apply_container_ip(inst, container, network):
             logger.warning("EC2: no container IP for %s; keeping synthetic addresses",
                            inst["InstanceId"])
             return
+        previous_ip = inst.get("PrivateIpAddress")
+        if previous_ip and previous_ip != ip:
+            _vm_unregister_imds(previous_ip)
         inst["PrivateIpAddress"] = ip
         inst["PublicIpAddress"] = ip
         inst["PrivateDnsName"] = f"ip-{ip.replace('.', '-')}.ec2.internal"
         inst["PublicDnsName"] = f"ec2-{ip.replace('.', '-')}.compute-1.amazonaws.com"
+        _vm_register_imds(inst, ip)
+        _vm_apply_security_groups(inst, container)
     except Exception as e:
         logger.warning("EC2: could not read container IP for %s: %s", inst["InstanceId"], e)
+
+
+def _vm_register_imds(inst, ip):
+    """Register the container IP for link-local IMDS."""
+    from ministack.core.imds_registry import ImdsRegistry
+
+    placement = inst.get("Placement") or {}
+    availability_zone = placement.get("AvailabilityZone") or f"{get_region()}a"
+    ImdsRegistry.register(ip, inst["InstanceId"], availability_zone)
+
+
+def _vm_unregister_imds(ip):
+    """Drop link-local IMDS registration for a container IP."""
+    from ministack.core.imds_registry import ImdsRegistry
+
+    ImdsRegistry.unregister(ip)
+
+
+def _vm_apply_security_groups(inst, container):
+    """Apply security group iptables inside the instance container."""
+    from ministack.services import ec2_sg_net
+
+    ec2_sg_net.apply_instance_security_groups(container, inst, _security_groups, _instances)
+
+
+def _vm_refresh_security_group(sg_id):
+    """Re-apply iptables after Authorize/Revoke on a security group."""
+    from ministack.services import ec2_sg_net
+
+    ec2_sg_net.refresh_security_group(sg_id, _security_groups, _instances, _vm_get_container)
 
 
 def _probe_shell(container):
@@ -2461,6 +2502,16 @@ def _vm_launch(inst, image_ref):
         kwargs["command"] = ["sleep", "infinity"]
     if network:
         kwargs["network"] = network
+    if os.environ.get("MINISTACK_EC2_SECURITY_GROUPS", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        caps = list(kwargs.get("cap_add") or [])
+        if "NET_ADMIN" not in caps:
+            caps.append("NET_ADMIN")
+        kwargs["cap_add"] = caps
     kwargs.update(_parse_ec2_docker_flags(EC2_DOCKER_FLAGS))
     container = client.containers.run(ref, **kwargs)
     global _docker_in_use
@@ -2469,6 +2520,13 @@ def _vm_launch(inst, image_ref):
     inst["_container_name"] = name
     inst["VmManager"] = "docker"
     _vm_apply_container_ip(inst, container, network)
+    try:
+        from ministack.services.imds_linklocal import start_instance_imds_sidecar
+
+        gateway_port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+        start_instance_imds_sidecar(client, container, str(gateway_port), network)
+    except Exception as err:
+        logger.warning("EC2: could not start IMDS sidecar for %s: %s", inst["InstanceId"], err)
     inst["_ssm_managed"] = _probe_shell(container)
     logger.info("EC2: instance %s running in container %s (image %s)",
                 inst["InstanceId"], name, image_ref)
@@ -2500,7 +2558,19 @@ def _drop_container(container):
 
 
 def _vm_remove_container(inst):
+    previous_ip = inst.get("PrivateIpAddress")
+    if previous_ip:
+        _vm_unregister_imds(previous_ip)
     container = _vm_get_container(inst)
+    if container is not None:
+        try:
+            client = _get_docker()
+            if client is not None:
+                from ministack.services.imds_linklocal import stop_instance_imds_sidecar
+
+                stop_instance_imds_sidecar(client, container.name)
+        except Exception as err:
+            logger.warning("EC2: could not remove IMDS sidecar for %s: %s", inst["InstanceId"], err)
     if container is not None:
         try:
             container.remove(force=True)

@@ -3226,13 +3226,18 @@ async def app(scope, receive, send):
     ):
         return
 
+    client_ip = (scope.get("client") or ("127.0.0.1",))[0]
+    if path.startswith("/latest/") or path.startswith("/v2/credentials"):
+        headers = dict(headers)
+        headers["x-ministack-imds-client-ip"] = client_ip
+
     if await _send_if_handled(
         send,
         await _handle_special_data_plane_request(
             method, path, headers, body, query_params, request_id,
             raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
             raw_query_string=query_string,
-            client_ip=(scope.get("client") or ("127.0.0.1",))[0],
+            client_ip=client_ip,
         ),
         receive,
     ):
@@ -3407,6 +3412,19 @@ async def _handle_lifespan(scope, receive, send):
                 _sched_mod.start_scheduler()
             except Exception as e:
                 logger.warning("Scheduler startup failed: %s", e)
+            try:
+                from ministack.services import ec2 as _ec2_mod
+                from ministack.services.imds_linklocal import start_link_local_imds
+
+                _docker_client = _ec2_mod._get_docker()
+                _imds_network = (
+                    _ec2_mod._get_ministack_network(_docker_client) if _docker_client else None
+                )
+                if not _imds_network:
+                    _imds_network = os.environ.get("DOCKER_NETWORK") or None
+                start_link_local_imds(_imds_network, str(port))
+            except Exception as e:
+                logger.warning("IMDS link-local startup failed: %s", e)
             await send({"type": "lifespan.startup.complete"})
             logger.info("Ready — %d services available on port %s.", len(SERVICE_HANDLERS), port)
             # Per-service "init completed" lines are logged at DEBUG only — at
@@ -3436,6 +3454,12 @@ async def _handle_lifespan(scope, receive, send):
                     await _iot_mod.mtls_stop()
                 except Exception as e:
                     logger.debug("IoT mTLS shutdown error: %s", e)
+            try:
+                from ministack.services.imds_linklocal import stop_link_local_imds
+
+                stop_link_local_imds()
+            except Exception as e:
+                logger.debug("IMDS link-local shutdown error: %s", e)
             _stop_docker_containers()
             await send({"type": "lifespan.shutdown.complete"})
             return

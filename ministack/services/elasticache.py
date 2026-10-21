@@ -538,14 +538,17 @@ def _spawn_redis_container(name, engine, engine_version, labels):
 
     try:
         run_kwargs = dict(
-            image=image, detach=True,
-            ports={f"{container_port}/tcp": host_port},
+            image=image,
+            detach=True,
             name=name,
             labels=labels,
             volumes={},
         )
         if DOCKER_NETWORK:
+            # Reachable by container IP on the shared network; skip host port binds.
             run_kwargs["network"] = DOCKER_NETWORK
+        else:
+            run_kwargs["ports"] = {f"{container_port}/tcp": host_port}
         container = docker_client.containers.run(**run_kwargs)
         if DOCKER_NETWORK:
             container.reload()

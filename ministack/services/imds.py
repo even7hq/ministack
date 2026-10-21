@@ -22,7 +22,11 @@ import os
 import secrets
 import time
 
+from ministack.core.imds_registry import ImdsRegistry
 from ministack.core.responses import get_account_id, get_region, new_uuid
+
+IMDS_CLIENT_IP_HEADER = "x-ministack-imds-client-ip"
+IMDS_LINK_LOCAL_HEADER = "x-ministack-imds-link-local"
 from ministack.services.iam import (
     _future,
     _gen_secret,
@@ -126,17 +130,54 @@ def _ecs_task_credentials_doc() -> dict:
     }
 
 
-def _identity_document() -> dict:
+def _registry_entry(headers: dict):
+    """
+    Look up per-container metadata when the caller IP is registered.
+
+    @param headers - Request headers (may include link-local client IP)
+    @returns Registry entry dict, or None when unknown or no IP header
+    """
+    client_ip = headers.get(IMDS_CLIENT_IP_HEADER, "")
+    if not client_ip:
+        return None
+
+    return ImdsRegistry.lookup(client_ip)
+
+
+def _link_local_strict(headers: dict) -> bool:
+    """Whether an unknown registry miss must return 404 (link-local proxy only)."""
+    return headers.get(IMDS_LINK_LOCAL_HEADER, "") == "1"
+
+
+def _instance_context(headers: dict) -> tuple[str, str] | None:
+    """
+    Resolve instance id and AZ for this IMDS request.
+
+    @param headers - Request headers (may include link-local client IP)
+    @returns Tuple of (instance_id, availability_zone), or None when link-local strict 404 applies
+    """
+    entry = _registry_entry(headers)
+    if entry:
+        return entry["instance_id"], entry["availability_zone"]
+
+    if _link_local_strict(headers):
+        return None
+
+    return _INSTANCE_ID, f"{get_region()}a"
+
+
+def _identity_document(instance_id: str, availability_zone: str) -> dict:
+    region = availability_zone[:-1] if availability_zone else get_region()
     return {
         "accountId": get_account_id(),
         "architecture": "x86_64",
-        "availabilityZone": f"{get_region()}a",
+        "availabilityZone": availability_zone,
         "imageId": "ami-ministack",
-        "instanceId": _INSTANCE_ID,
+        "instanceId": instance_id,
         "instanceType": "t3.micro",
         "pendingTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "privateIp": "127.0.0.1",
-        "region": get_region(),
+        "region": region,
         "version": "2017-09-30",
     }
 
@@ -187,13 +228,21 @@ async def handle_request(method, path, headers, body, query_params):
         return _text("\n".join(keys))
 
     if path == "/latest/meta-data/instance-id":
-        return _text(_INSTANCE_ID)
+        context = _instance_context(headers)
+        if context is None:
+            return _not_found()
+        instance_id, _az = context
+        return _text(instance_id)
 
     if path.startswith("/latest/meta-data/placement/"):
         leaf = path[len("/latest/meta-data/placement/"):]
-        region = get_region()
+        context = _instance_context(headers)
+        if context is None:
+            return _not_found()
+        _instance_id, availability_zone = context
+        region = availability_zone[:-1] if availability_zone else get_region()
         placement = {
-            "availability-zone": f"{region}a",
+            "availability-zone": availability_zone,
             "availability-zone-id": f"{region[:3]}1-az1",
             "region": region,
         }
@@ -223,7 +272,11 @@ async def handle_request(method, path, headers, body, query_params):
         })
 
     if path == "/latest/dynamic/instance-identity/document":
-        return _json_resp(_identity_document())
+        context = _instance_context(headers)
+        if context is None:
+            return _not_found()
+        instance_id, availability_zone = context
+        return _json_resp(_identity_document(instance_id, availability_zone))
 
     if path == "/latest/dynamic/instance-identity/pkcs7" or \
             path == "/latest/dynamic/instance-identity/signature":

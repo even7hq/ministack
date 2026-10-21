@@ -15,10 +15,13 @@ services:
       - RDS_BASE_PORT=15432
       # - DSQL_BASE_PORT=25432  # first host port for DSQL cluster proxies
       # - DSQL_STRICT=1  # run a real Postgres container per DSQL cluster (default: control-plane-only)
-      # - DOCKER_NETWORK=ministack_default  # Docker network for RDS/DSQL/EKS/ElastiCache/Lambda containers
+      - DOCKER_NETWORK=ministack_default
       - ELASTICACHE_BASE_PORT=16379
+      # Docker socket bind mounts need a host path (not /opt/ministack inside this container).
+      - MINISTACK_IMDS_LISTENER_HOST_SCRIPT=${PWD}/scripts/ImdsLinkLocalListener.py
     volumes:
       - ./data/s3:/tmp/ministack-data/s3
+      - ./scripts:/opt/ministack/scripts:ro
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       redis:

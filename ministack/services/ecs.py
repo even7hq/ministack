@@ -835,18 +835,39 @@ def _record_task_ip(task, container, ecs_network):
         if task.get("_container_ip") or task.get("attachments"):
             return
         task["_container_ip"] = ip
-        if task.get("_network_mode") != "awsvpc":
-            return
-        details = [{"name": "privateIPv4Address", "value": ip}]
-        subnet = task.get("_subnet")
-        if subnet:
-            details.insert(0, {"name": "subnetId", "value": subnet})
-        task["attachments"] = [{
-            "id": new_uuid(),
-            "type": "ElasticNetworkInterface",
-            "status": "ATTACHED",
-            "details": details,
-        }]
+        if task.get("_network_mode") == "awsvpc":
+            details = [{"name": "privateIPv4Address", "value": ip}]
+            subnet = task.get("_subnet")
+            if subnet:
+                details.insert(0, {"name": "subnetId", "value": subnet})
+            task["attachments"] = [{
+                "id": new_uuid(),
+                "type": "ElasticNetworkInterface",
+                "status": "ATTACHED",
+                "details": details,
+            }]
+    _ecs_register_imds_for_task(task, ip, ecs_network)
+
+
+def _ecs_register_imds_for_task(task, ip, ecs_network):
+    """Register ECS task container IPs on the MiniStack Docker network for IMDS."""
+    from ministack.core.imds_registry import ImdsRegistry
+    from ministack.core.responses import get_region
+    from ministack.services import ec2 as ec2_mod
+
+    if not ip or not ecs_network:
+        return
+
+    docker_client = ec2_mod._get_docker()
+    ministack_network = ec2_mod._get_ministack_network(docker_client) if docker_client else None
+    if ministack_network and ecs_network != ministack_network:
+        return
+
+    task_arn = task.get("taskArn") or ""
+    task_suffix = task_arn.rsplit("/", 1)[-1] if task_arn else new_uuid().replace("-", "")
+    instance_id = task.get("_imds_instance_id") or ("i-" + task_suffix.replace("-", "")[:17])
+    availability_zone = task.get("_availability_zone") or f"{get_region()}a"
+    ImdsRegistry.register(ip, instance_id, availability_zone)
 
 
 def _task_ip(task):

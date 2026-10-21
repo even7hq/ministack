@@ -64,6 +64,7 @@ COPY bin/awslocal /usr/local/bin/awslocal
 RUN chmod +x /usr/local/bin/awslocal
 
 COPY ministack/ ministack/
+COPY scripts/ scripts/
 COPY --from=plugin-donor /opt/ministack/mysql-plugins /opt/ministack/mysql-plugins
 
 RUN addgroup -S ministack && adduser -S ministack -G ministack

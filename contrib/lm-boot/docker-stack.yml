@@ -1,0 +1,39 @@
+# Reference Swarm stack for LuckyMaker boot against MiniStack.
+# Requires: docker swarm init, DOCKER_NETWORK attachable overlay, built LM image.
+version: "3.8"
+
+services:
+  ministack:
+    image: ministackorg/ministack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      GATEWAY_PORT: "4566"
+      DOCKER_NETWORK: ministack_lm
+      MINISTACK_IMDS_LINK_LOCAL: "1"
+      RDS_BASE_PORT: "15432"
+      ELASTICACHE_BASE_PORT: "16379"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - ministack_lm
+
+  luckymaker:
+    image: luckymaker:latest
+    environment:
+      AWS_ENDPOINT_URL: http://ministack:4566
+      S3_ENDPOINT_URL: http://ministack:4566
+      AWS_REGION: us-east-1
+      NODE_ENV: production
+    networks:
+      - ministack_lm
+    deploy:
+      replicas: 2
+      endpoint_mode: vip
+    # Overlay tasks need a sidecar in the same network namespace for 169.254.169.254.
+    # See contrib/lm-boot/README.md for the imds sidecar pattern.
+
+networks:
+  ministack_lm:
+    driver: overlay
+    attachable: true
