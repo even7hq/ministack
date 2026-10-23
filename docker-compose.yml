@@ -9,9 +9,10 @@ services:
     environment:
       - GATEWAY_PORT=4566
       - LOG_LEVEL=INFO
-      # Root checks are on. Keys come from .env (ROOT_KEYS=gio=secret).
+      # Root checks are on. Keys come from ./root-keys.json
+      # ({"gio": "secret"}), which is gitignored.
       - ROOT_AUTH=true
-      - ROOT_KEYS=${ROOT_KEYS:-}
+      - ROOT_KEYS_FILE=/var/lib/ministack/root-keys.json
       # Turn the check off for this service with:
       #   command: ["--no-root-auth"]
       - S3_PERSIST=0
@@ -25,6 +26,7 @@ services:
       # Docker socket bind mounts need a host path (not /opt/ministack inside this container).
       - MINISTACK_IMDS_LISTENER_HOST_SCRIPT=${PWD}/scripts/ImdsLinkLocalListener.py
     volumes:
+      - ./root-keys.json:/var/lib/ministack/root-keys.json:ro
       - ./data/s3:/tmp/ministack-data/s3
       - ./scripts:/opt/ministack/scripts:ro
       - /var/run/docker.sock:/var/run/docker.sock

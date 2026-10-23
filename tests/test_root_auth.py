@@ -167,12 +167,57 @@ def test_root_keys_parse_pairs_and_reject_a_bad_entry(monkeypatch):
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
     monkeypatch.delenv("ROOT_KEYS", raising=False)
+    monkeypatch.delenv("ROOT_KEYS_FILE", raising=False)
     assert configured_root_keys() == {}
     monkeypatch.setenv("ROOT_KEYS", "dev=abc=def, ci=other")
     assert configured_root_keys() == {"dev": "abc=def", "ci": "other"}
     monkeypatch.setenv("ROOT_KEYS", "noseparator")
     with pytest.raises(ValueError, match="access_key=secret"):
         configured_root_keys()
+
+
+def test_root_keys_file_loads_and_env_overrides_the_same_id(monkeypatch, tmp_path):
+    """The JSON file is the key list. ROOT_KEYS replaces the same id."""
+    from ministack.core.iam_evaluator import configured_root_keys
+
+    path = tmp_path / "root-keys.json"
+    path.write_text('{"gio": "from-file", "other": "stays"}', encoding="utf-8")
+    monkeypatch.setenv("ROOT_KEYS_FILE", str(path))
+    monkeypatch.delenv("ROOT_KEYS", raising=False)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    assert configured_root_keys() == {"gio": "from-file", "other": "stays"}
+
+    monkeypatch.setenv("ROOT_KEYS", "gio=from-env")
+    assert configured_root_keys() == {"gio": "from-env", "other": "stays"}
+
+    missing = tmp_path / "missing.json"
+    monkeypatch.setenv("ROOT_KEYS_FILE", str(missing))
+    monkeypatch.delenv("ROOT_KEYS", raising=False)
+    assert configured_root_keys() == {}
+
+    path.write_text("[]", encoding="utf-8")
+    monkeypatch.setenv("ROOT_KEYS_FILE", str(path))
+    with pytest.raises(ValueError, match="JSON object"):
+        configured_root_keys()
+
+
+def test_root_auth_accepts_a_key_from_the_file(monkeypatch, tmp_path):
+    """A signature made with the secret in ROOT_KEYS_FILE is the account root."""
+    from ministack import app as app_mod
+
+    path = tmp_path / "root-keys.json"
+    path.write_text('{"gio": "file-secret"}', encoding="utf-8")
+    monkeypatch.setattr(app_mod, "ROOT_AUTH", True)
+    monkeypatch.setenv("ROOT_KEYS_FILE", str(path))
+    monkeypatch.delenv("ROOT_KEYS", raising=False)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    status, payload = _call(
+        app_mod, "POST", "/", b"", b"Action=GetCallerIdentity&Version=2011-06-15", "gio", "file-secret", True,
+    )
+    assert status == 200
+    assert b":root</Arn>" in payload
 
 
 def test_no_root_auth_command_accepts_unsigned_calls(monkeypatch):
