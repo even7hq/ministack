@@ -3814,8 +3814,8 @@ def _pid_file(port: int) -> str:
 
 
 def main():
-    from hypercorn.asyncio import serve as hypercorn_serve
-    from hypercorn.config import Config as HypercornConfig
+    from ministack.core.root_keys import add_parser as add_root_key_parser
+    from ministack.core.root_keys import execute as execute_root_key
 
     parser = argparse.ArgumentParser(description="MiniStack — Local AWS Service Emulator")
     parser.add_argument("-d", "--detach", action="store_true", help="Run in the background (detached mode)")
@@ -3825,7 +3825,15 @@ def main():
         action="store_true",
         help="Accept unsigned requests as the account root. Overrides ROOT_AUTH=true.",
     )
+    add_root_key_parser(parser.add_subparsers(dest="command"))
     args = parser.parse_args()
+    # Writing a key must not start the server or import the HTTP stack.
+    if args.command == "root-key":
+        raise SystemExit(execute_root_key(args))
+
+    from hypercorn.asyncio import serve as hypercorn_serve
+    from hypercorn.config import Config as HypercornConfig
+
     if args.no_root_auth:
         disable_root_auth()
 

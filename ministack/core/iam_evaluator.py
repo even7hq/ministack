@@ -970,32 +970,13 @@ def is_root_access_key(access_key_id: str) -> bool:
 
 
 def _root_keys_from_file() -> dict[str, str]:
-    """Keys from ``ROOT_KEYS_FILE``, or nothing when that path is unset or missing.
+    """Keys from ``ROOT_KEYS_FILE``, or nothing when that path is unset or missing."""
+    from ministack.core.root_keys import load_root_keys_file
 
-    The file is a JSON object of access key id to secret. The id is the
-    object key. The secret stays recoverable because SigV4 checks recompute
-    the HMAC with it. A missing file is an empty list. Broken JSON, a
-    non-object, or an empty secret raises ``ValueError``.
-    """
     path = os.environ.get("ROOT_KEYS_FILE", "").strip()
-    if not path or not os.path.isfile(path):
+    if not path:
         return {}
-    try:
-        with open(path, encoding="utf-8") as handle:
-            loaded = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"ROOT_KEYS_FILE {path} is not valid JSON") from exc
-    if not isinstance(loaded, dict):
-        raise ValueError(f"ROOT_KEYS_FILE {path} must be a JSON object of access key to secret")
-    keys: dict[str, str] = {}
-    for access_key, secret in loaded.items():
-        access_key = str(access_key).strip()
-        if not access_key or not isinstance(secret, str) or secret == "":
-            raise ValueError(
-                f"ROOT_KEYS_FILE {path} entries must map an access key to a non-empty secret"
-            )
-        keys[access_key] = secret
-    return keys
+    return load_root_keys_file(path)
 
 
 def configured_root_keys() -> dict[str, str]:

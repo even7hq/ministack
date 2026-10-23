@@ -26,7 +26,7 @@ services:
       # Docker socket bind mounts need a host path (not /opt/ministack inside this container).
       - MINISTACK_IMDS_LISTENER_HOST_SCRIPT=${PWD}/scripts/ImdsLinkLocalListener.py
     volumes:
-      - ./root-keys.json:/var/lib/ministack/root-keys.json:ro
+      - ./root-keys.json:/var/lib/ministack/root-keys.json
       - ./data/s3:/tmp/ministack-data/s3
       - ./scripts:/opt/ministack/scripts:ro
       - /var/run/docker.sock:/var/run/docker.sock

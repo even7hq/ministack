@@ -72,7 +72,15 @@ curl http://localhost:4566/_ministack/health
 
 Docker starts with `ROOT_AUTH=true` and an empty key list. A service call without a configured key is refused, including S3. `/_ministack/health` and `/_ministack/ready` stay unsigned so the container healthcheck can run.
 
-Compose reads `./root-keys.json` (`ROOT_KEYS_FILE` inside the container). That file is gitignored, and `/_ministack/reset` does not delete it. The object key is the access key id. The value is the secret, which has to stay recoverable: SigV4 sends an HMAC, not the secret, and the server recomputes that HMAC. Create the file before `docker compose up`: a missing source becomes a directory when Docker mounts it. The copy in this repo is the access key `gio` with the password left as `secret`, to be replaced before use:
+Compose reads `./root-keys.json` (`ROOT_KEYS_FILE` inside the container). That file is gitignored, and `/_ministack/reset` does not delete it. The object key is the access key id. The value is the secret, which has to stay recoverable: SigV4 sends an HMAC, not the secret, and the server recomputes that HMAC. Create the file before the first `docker compose up`: a missing source becomes a directory when Docker mounts it.
+
+```bash
+ministack root-key set gio
+ministack root-key list
+ministack root-key remove gio
+```
+
+`set` asks for the secret at a prompt, so it does not land in the shell history. `--secret` is the non-interactive form, and that value shows up in the process list. `list` prints ids only. `--file` picks a path other than `ROOT_KEYS_FILE` or `./root-keys.json`. The file looks like this:
 
 ```json
 {
