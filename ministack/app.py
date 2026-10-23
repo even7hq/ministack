@@ -29,6 +29,21 @@ from urllib.parse import parse_qs, quote, unquote, urlencode
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
 AUTH = os.environ.get("AUTH", "false").lower() == "true"
+# Root keys skip signature checks under AUTH. ROOT_AUTH turns that check on
+# without requiring an IAM policy for the account root. The Docker image sets
+# this; `ministack --no-root-auth` turns it back off.
+ROOT_AUTH = os.environ.get("ROOT_AUTH", "false").lower() == "true"
+
+
+def disable_root_auth() -> None:
+    """Stop requiring a configured root key for this process.
+
+    ``ministack --no-root-auth`` calls this. The Docker entrypoint is
+    ``python -m ministack``, so the same flag is the container command.
+    """
+    global ROOT_AUTH
+    ROOT_AUTH = False
+    os.environ["ROOT_AUTH"] = "false"
 
 _VERSION = os.environ.get("MINISTACK_VERSION") or ""
 
@@ -224,10 +239,14 @@ from ministack.core.concurrency import spawn_background
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
+    AuthError,
+    ResolvedCredential,
+    authenticate,
     find_iam_access_key_account,
     pin_request_origin,
     pin_signed_body,
     pin_signed_request,
+    s3_presigned_query,
 )
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
@@ -891,6 +910,7 @@ def _handle_health_request(path: str, request_id: str):
             {
                 "services": {s: "available" for s in SERVICE_HANDLERS},
                 "auth": "enabled" if AUTH else "disabled",
+                "root_auth": "enabled" if ROOT_AUTH else "disabled",
                 "edition": os.environ.get("MINISTACK_EDITION", "light"),
                 "version": _version(),
                 "iot_mtls": _iot_mtls_state,
@@ -1294,6 +1314,21 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         None if owns_cors else _handle_options_request(method, request_id),
         _handle_health_request(path, request_id),
         _handle_ready_request(path, request_id),
+    ):
+        if response is not None:
+            return response
+
+    if ROOT_AUTH:
+        # Admin routes run after the body is signed. Health and ready stay
+        # unsigned so the container healthcheck can call them.
+        return None
+
+    return await _handle_admin_pre_body(method, path, headers, query_params, request_id)
+
+
+async def _handle_admin_pre_body(method: str, path: str, headers: dict, query_params: dict, request_id: str):
+    """Routes that need no body, but are not public when ROOT_AUTH is on."""
+    for response in (
         _handle_unknown_localstack_request(path, request_id),
         _handle_lambda_download_request(path, method),
     ):
@@ -2372,6 +2407,25 @@ def _credential_failure(service: str, iam_action: str, request_id: str, denied, 
     return status, resp_headers, body
 
 
+def _root_auth_failure(access_key: str, method: str, path: str, headers: dict, query_params: dict, request_id: str):
+    """Refuse a request whose signature does not match the server secret.
+
+    Returns None when the signature checks out. Health and ready never reach
+    this. S3 presigned URLs are not passed here, because S3 checks those itself.
+    """
+    from ministack.core.responses import get_account_id
+
+    checked = authenticate(access_key or "", get_account_id())
+    if isinstance(checked, ResolvedCredential):
+        return None
+    if isinstance(checked, AuthError):
+        failure = checked
+    else:
+        failure = AuthError("MissingAuthenticationToken", "Missing Authentication Token")
+    service = detect_service(method, path, headers, query_params) or "sts"
+    return _credential_failure(service, "", request_id, failure, headers)
+
+
 def _authenticate_only(service: str, headers: dict, query_params: dict, request_id: str):
     """Under AUTH, refuse a request no IAM action covers when its credentials fail."""
     if not AUTH:
@@ -3207,7 +3261,7 @@ async def app(scope, receive, send):
     ):
         return
 
-    if AUTH:
+    if AUTH or ROOT_AUTH:
         raw_path = scope.get("raw_path") or quote(path).encode()
         pin_signed_request(method, raw_path.decode("latin-1"), query_params, scope.get("headers", []))
     try:
@@ -3220,6 +3274,26 @@ async def app(scope, receive, send):
             await _send_if_handled(send, response, receive)
             return
         body = exc.body
+
+    # ROOT_AUTH checks the root secret. S3 presigned URLs are verified by S3.
+    if ROOT_AUTH and not s3_presigned_query(query_params):
+        failure = _root_auth_failure(
+            extract_access_key_id(headers, query_params),
+            method,
+            path,
+            headers,
+            query_params,
+            request_id,
+        )
+        if failure is not None:
+            await _send_if_handled(send, failure, receive)
+            return
+
+    if ROOT_AUTH:
+        if await _send_if_handled(
+            send, await _handle_admin_pre_body(method, path, headers, query_params, request_id), receive
+        ):
+            return
 
     if await _send_if_handled(
         send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id), receive
@@ -3746,7 +3820,14 @@ def main():
     parser = argparse.ArgumentParser(description="MiniStack — Local AWS Service Emulator")
     parser.add_argument("-d", "--detach", action="store_true", help="Run in the background (detached mode)")
     parser.add_argument("--stop", action="store_true", help="Stop a detached MiniStack server")
+    parser.add_argument(
+        "--no-root-auth",
+        action="store_true",
+        help="Accept unsigned requests as the account root. Overrides ROOT_AUTH=true.",
+    )
     args = parser.parse_args()
+    if args.no_root_auth:
+        disable_root_auth()
 
     port = int(_resolve_port())
     # BIND_HOST controls the bind interface; defaults to 0.0.0.0 (existing

@@ -969,6 +969,43 @@ def is_root_access_key(access_key_id: str) -> bool:
     )
 
 
+def configured_root_keys() -> dict[str, str]:
+    """Root access keys this process will accept when ``ROOT_AUTH`` is on.
+
+    The default is an empty map. ``ROOT_KEYS`` is a comma-separated list of
+    ``access_key=secret`` pairs. ``AWS_ACCESS_KEY_ID`` and
+    ``AWS_SECRET_ACCESS_KEY`` add one more pair when both are set. Unset
+    variables do not become ``test`` / ``test``. A ``ROOT_KEYS`` entry that
+    is not ``access_key=secret`` raises ``ValueError``.
+    """
+    keys: dict[str, str] = {}
+    raw = os.environ.get("ROOT_KEYS", "")
+    for item in raw.split(","):
+        entry = item.strip()
+        if not entry:
+            continue
+        access_key, sep, secret = entry.partition("=")
+        access_key = access_key.strip()
+        if not sep or not access_key or secret == "":
+            raise ValueError("ROOT_KEYS entries must be access_key=secret")
+        keys[access_key] = secret
+
+    # The single pair is optional. An access key alone is not a credential.
+    if "AWS_ACCESS_KEY_ID" in os.environ and "AWS_SECRET_ACCESS_KEY" in os.environ:
+        access_key = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
+        secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+        if access_key and secret != "":
+            keys[access_key] = secret
+    return keys
+
+
+def _configured_root_secret(access_key_id: str) -> str | None:
+    """The secret for one configured root key, or None when it is not listed."""
+    if not access_key_id:
+        return None
+    return configured_root_keys().get(access_key_id)
+
+
 def _unknown_access_key() -> CredentialResolutionError:
     return CredentialResolutionError(
         "UnrecognizedClientException",
@@ -1051,7 +1088,30 @@ def resolve_credential(
 
     account_id = account_id or get_account_id()
 
-    if is_root_access_key(access_key_id):
+    # Each configured root key has its own secret. Unlisted keys are not root
+    # while ROOT_AUTH is on, including the historical "test" key.
+    if _root_signature_required():
+        secret = _configured_root_secret(access_key_id)
+        if secret is not None:
+            if _ACCOUNT_ID_RE.fullmatch(access_key_id):
+                if account_id != access_key_id:
+                    return _unknown_access_key()
+                account_id = access_key_id
+            configured_token = os.environ.get("AWS_SESSION_TOKEN") or None
+            token_error = _validate_session_token(configured_token, session_token)
+            if token_error:
+                return token_error
+            return ResolvedCredential(
+                access_key_id=access_key_id,
+                secret_access_key=secret,
+                session_token=configured_token,
+                account_id=account_id,
+                principal_arn=f"arn:aws:iam::{account_id}:root",
+                principal_id=account_id,
+                principal_type="Root",
+                source_access_key_id=access_key_id,
+            )
+    elif is_root_access_key(access_key_id):
         if _ACCOUNT_ID_RE.fullmatch(access_key_id):
             if account_id != access_key_id:
                 return _unknown_access_key()
@@ -1263,11 +1323,21 @@ _signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.Cont
 _verified_key: contextvars.ContextVar[str] = contextvars.ContextVar("ministack_verified_key", default="")
 
 
+def _root_signature_required() -> bool:
+    """Whether a root key must carry a signature that matches the server secret."""
+    from ministack.app import ROOT_AUTH
+
+    return ROOT_AUTH
+
+
 def caller_verified(access_key_id: str, account_id: str) -> bool:
-    """Whether the request's SigV4/SigV2 signature for this key checks out (root keys are not checked)."""
+    """Whether the request's SigV4/SigV2 signature for this key checks out.
+
+    Root keys are not checked unless ``ROOT_AUTH`` is set.
+    """
     if not access_key_id:
         return False
-    if _is_root_key(access_key_id) or _verified_key.get() == access_key_id:
+    if (_is_root_key(access_key_id) and not _root_signature_required()) or _verified_key.get() == access_key_id:
         return True
     checked = authenticate(access_key_id, account_id)
     return checked is not None and not isinstance(checked, AuthError)
@@ -1276,7 +1346,12 @@ def caller_verified(access_key_id: str, account_id: str) -> bool:
 def pin_signed_request(
     method: str, raw_path: str, query_params: dict, raw_headers: list, handshake: bool = False,
 ) -> None:
-    """Keep a request signed with an IAM user or STS session key as sent, for its signature check."""
+    """Keep a signed request as sent, for its signature check.
+
+    IAM user and STS session keys are always kept. Root keys are kept only
+    when ``ROOT_AUTH`` is set. Without it, a ``Credential=test`` request with
+    a fake signature still goes through.
+    """
     from ministack.core.router import extract_access_key_id
     from ministack.core.sigv4 import decode_header_value
 
@@ -1290,7 +1365,8 @@ def pin_signed_request(
     sigv2 = authorization.startswith("AWS ") or bool(
         _query_value(query_params or {}, "AWSAccessKeyId") and _query_value(query_params or {}, "Signature")
         and not _query_value(query_params or {}, "SignatureVersion"))
-    if sigv2 and claimed and not _is_root_key(claimed) and not authorization.startswith("AWS4-"):
+    root_checked = _root_signature_required()
+    if sigv2 and claimed and (not _is_root_key(claimed) or root_checked) and not authorization.startswith("AWS4-"):
         headers = {name.decode("latin-1").lower(): decode_header_value(value) for name, value in raw_headers}
         from ministack.app import _extract_s3_vhost_bucket
         bucket = _extract_s3_vhost_bucket(headers.get("host", ""))
@@ -1299,11 +1375,14 @@ def pin_signed_request(
         return
     # A SigV4 signature that names no key is checked too: it is incomplete or names an unknown key.
     names_no_key = not claimed and (authorization.startswith("AWS4-HMAC-SHA256") or presigned)
+    # Root signatures stay unchecked unless ROOT_AUTH is on, so existing
+    # Credential=test requests with a fake signature keep working.
+    root_signature_skipped = claimed and _is_root_key(claimed) and not root_checked
     if not verifiable and not names_no_key and _signature_attempted(authorization, query_params) and not (
-            claimed and _is_root_key(claimed)) and not _s3_presigned_query(query_params):
+            root_signature_skipped) and not _s3_presigned_query(query_params):
         _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, {}, unverifiable=True))
         return
-    if not (verifiable or names_no_key) or (access_key_id and _is_root_key(access_key_id)):
+    if not (verifiable or names_no_key) or (access_key_id and _is_root_key(access_key_id) and not root_checked):
         _signed_request.set(None)
         return
     headers: dict[str, str] = {}
@@ -1380,6 +1459,11 @@ def _s3_presigned_query(query_params: dict) -> bool:
     scope = _query_value(query_params, "X-Amz-Credential").split("/")
     return (_query_value(query_params, "X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and bool(scope[0])
             and len(scope) == 5 and scope[3] == "s3" and bool(_query_value(query_params, "X-Amz-Signature")))
+
+
+def s3_presigned_query(query_params: dict) -> bool:
+    """A complete SigV4 presigned S3 URL, which S3 verifies itself."""
+    return _s3_presigned_query(query_params)
 
 
 def _query_signed(query_params: dict) -> bool:

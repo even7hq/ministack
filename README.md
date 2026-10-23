@@ -44,7 +44,7 @@ pip install ministack
 ministack
 # Runs on http://localhost:4566 — use GATEWAY_PORT=XXXX to change
 
-# Option 2: Docker Hub
+# Option 2: Docker Hub. The image checks root signatures and ships with no keys.
 docker run -p 4566:4566 ministackorg/ministack
 
 # Option 2b: Docker Hub with real infrastructure (RDS, ECS, Lambda containers)
@@ -64,7 +64,48 @@ docker compose up -d
 curl http://localhost:4566/_ministack/health
 ```
 
-That's it. No account, no API key, no sign-up.
+`pip install ministack` accepts unsigned calls. The Docker image does not: root signature checks are on, and no access key is configured until you set `ROOT_KEYS`. Health checks stay open. See [Root access keys](#root-access-keys).
+
+---
+
+## Root access keys
+
+Docker starts with `ROOT_AUTH=true` and an empty key list. A service call without a configured key is refused, including S3. `/_ministack/health` and `/_ministack/ready` stay unsigned so the container healthcheck can run.
+
+`ROOT_KEYS` is a comma-separated list of `access_key=secret` pairs. Each access key has its own secret. Setting `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` together adds one more pair. Neither variable defaults to `test`.
+
+```bash
+docker run -p 4566:4566 \
+  -e ROOT_KEYS='dev=secret,ci=other-secret' \
+  ministackorg/ministack
+```
+
+Compose reads `.env` next to `docker-compose.yml` and passes `ROOT_KEYS` into the container. That file is gitignored. The copy in this repo is the access key `gio` with the password left as `secret`, to be replaced before use:
+
+```bash
+ROOT_KEYS=gio=secret
+```
+
+```bash
+export AWS_ACCESS_KEY_ID=dev
+export AWS_SECRET_ACCESS_KEY=secret
+export AWS_DEFAULT_REGION=us-east-1
+aws --endpoint-url=http://localhost:4566 sts get-caller-identity
+```
+
+The same image with the check off, as a container command (`python -m ministack` is the entrypoint):
+
+```bash
+docker run -p 4566:4566 ministackorg/ministack --no-root-auth
+```
+
+In Compose, put the flag on the service instead of `docker run`:
+
+```yaml
+command: ["--no-root-auth"]
+```
+
+`ROOT_AUTH=false` is the same switch for a process that is not started from the image entrypoint. `AUTH=true` is separate: it evaluates IAM policies and still does not check these root secrets unless `ROOT_AUTH` is on.
 
 ---
 
@@ -895,6 +936,10 @@ When Docker is available, `StartApplication` for a `FLINK-1_19` or `FLINK-1_20` 
 | `MINISTACK_HOST` | `localhost` | Hostname used in response URLs and EKS cluster endpoints. Set a hostname reachable by your clients, not a wildcard bind address |
 | `MINISTACK_ACCOUNT_ID` | `000000000000` | Default AWS account ID. Overridden per-request when `AWS_ACCESS_KEY_ID` is a 12-digit number (see [Multi-Tenancy](#multi-tenancy)) |
 | `MINISTACK_REGION` | `us-east-1` | AWS region reported in ARNs and service responses across all services |
+| `ROOT_AUTH` | `false` in the process, `true` in the Docker image | Require a SigV4 signature for a key in `ROOT_KEYS` on every request except `/_ministack/health` and `/_ministack/ready`. Unsigned calls, including S3, are refused. `ministack --no-root-auth` (the Docker command) turns it off. `AUTH=true` does not check these secrets by itself |
+| `ROOT_KEYS` | _(empty)_ | Comma-separated `access_key=secret` pairs accepted when `ROOT_AUTH=true`. The default is no keys. A secret may contain `=`; split on the first one |
+| `AWS_ACCESS_KEY_ID` | `test` when `ROOT_AUTH` is off | With `ROOT_AUTH` off, `test`, this value, an empty key, and a 12-digit account id are the account root and the secret is not checked. With `ROOT_AUTH` on, this value is one more root key only when `AWS_SECRET_ACCESS_KEY` is set too |
+| `AWS_SECRET_ACCESS_KEY` | `test` when `ROOT_AUTH` is off | Secret for `AWS_ACCESS_KEY_ID` when both are set and `ROOT_AUTH=true`. Not used for keys listed only in `ROOT_KEYS` |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `S3_PERSIST` | `0` | Set `1` to persist S3 objects to disk |
 | `S3_DATA_DIR` | `/tmp/ministack-data/s3` | S3 persistence directory |
@@ -1208,8 +1253,12 @@ aws --endpoint-url=http://localhost:4566 eks delete-cluster --name my-cluster
 
 To enforce IAM, start MiniStack with `AUTH=true` (for example,
 `AUTH=true python -m ministack`, or add `AUTH=true` to the container environment).
-The root key/secret default to `test`/`test`; custom values must match the
-`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the MiniStack server.
+The root key and secret default to `test` / `test` while `ROOT_AUTH` is off,
+and that secret is not checked. `AUTH=true` evaluates IAM policies for
+non-root callers. On the Docker image `ROOT_AUTH` is already on: set
+`ROOT_KEYS` (see [Root access keys](#root-access-keys)) or start the
+container with `--no-root-auth`.
+
 Under `AUTH=true`, create the IAM role before running the cluster example above:
 
 ```bash

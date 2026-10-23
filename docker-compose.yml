@@ -9,6 +9,11 @@ services:
     environment:
       - GATEWAY_PORT=4566
       - LOG_LEVEL=INFO
+      # Root checks are on. Keys come from .env (ROOT_KEYS=gio=secret).
+      - ROOT_AUTH=true
+      - ROOT_KEYS=${ROOT_KEYS:-}
+      # Turn the check off for this service with:
+      #   command: ["--no-root-auth"]
       - S3_PERSIST=0
       - REDIS_HOST=redis
       - REDIS_PORT=6379
