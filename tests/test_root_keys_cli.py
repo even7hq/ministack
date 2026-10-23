@@ -1,5 +1,6 @@
 """ministack root-key writes the JSON file and does not start the server."""
 
+import errno
 import os
 import stat
 import subprocess
@@ -49,6 +50,22 @@ def test_set_rejects_an_empty_secret(tmp_path):
     result = _run(tmp_path, "set", "gio", "--secret", "")
     assert result.returncode == 1
     assert not (tmp_path / "root-keys.json").exists()
+
+
+def test_write_falls_back_when_replace_is_busy(tmp_path, monkeypatch):
+    """A single-file Docker mount rejects rename. The write still lands."""
+    from ministack.core.root_keys import write_root_keys_file
+
+    path = tmp_path / "root-keys.json"
+    path.write_text("{}\n", encoding="utf-8")
+
+    def busy(src, dst):
+        raise OSError(errno.EBUSY, "Resource busy")
+
+    monkeypatch.setattr(os, "replace", busy)
+    write_root_keys_file(str(path), {"gio": "s3cret"})
+    assert path.read_text(encoding="utf-8") == '{\n  "gio": "s3cret"\n}\n'
+    assert not list(tmp_path.glob(".root-keys.*.tmp"))
 
 
 def test_remove_of_a_missing_key_fails(tmp_path):

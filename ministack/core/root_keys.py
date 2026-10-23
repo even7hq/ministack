@@ -2,6 +2,7 @@
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """Read and write the root access key file used when ROOT_AUTH is on."""
 
+import errno
 import getpass
 import json
 import os
@@ -56,8 +57,10 @@ def write_root_keys_file(path: str, keys: dict[str, str]) -> None:
     """Replace ``path`` with ``keys``.
 
     The write is a temp file in the same directory, then ``os.replace``, so a
-    crash does not leave a half-written key list. The file mode is ``0600``.
-    ``keys`` maps an access key id to its secret.
+    crash does not leave a half-written key list. A Docker bind mount of this
+    file alone cannot be renamed over (``EBUSY``), so that case writes the
+    mounted file in place. The file mode is ``0600``. ``keys`` maps an access
+    key id to its secret.
     """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -69,7 +72,14 @@ def write_root_keys_file(path: str, keys: dict[str, str]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except OSError as exc:
+            # The path is the mount point of a single-file bind. rename fails.
+            if exc.errno != errno.EBUSY:
+                raise
+            _overwrite_mounted_file(path, payload)
+            os.unlink(tmp)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -77,6 +87,14 @@ def write_root_keys_file(path: str, keys: dict[str, str]) -> None:
             pass
         raise
     os.chmod(path, 0o600)
+
+
+def _overwrite_mounted_file(path: str, payload: str) -> None:
+    """Write ``payload`` onto an existing mount, which ``os.replace`` cannot swap."""
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def add_parser(subparsers) -> None:
