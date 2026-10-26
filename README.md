@@ -880,7 +880,29 @@ resp = bedrock.converse(
 print(resp["output"]["message"]["content"][0]["text"])
 ```
 
-Note: token counts are a chars/4 heuristic — shape-correct, but don't assert on exact counts against the mock.
+That one URL is a single backend for every model id. To register models of your own, so `ListFoundationModels` and `GetFoundationModel` return them and only those ids are forwarded, use `local-models.json`.
+
+The compose file mounts `./local-models/` and sets `LOCAL_MODELS_URL` to the `ollama` service on the `models` profile. Create a model, then pull it in Ollama under the upstream name:
+
+```bash
+docker compose --profile models up -d
+docker compose exec ministack python -m ministack model set qwythos-9b \
+  --model hf.co/empero-ai/Qwythos-9B-v2-GGUF:Q4_K_M --name "Qwythos 9B"
+docker compose exec ollama ollama pull hf.co/empero-ai/Qwythos-9B-v2-GGUF:Q4_K_M
+```
+
+`model set` writes `local-models/local-models.json`. `--url` overrides `LOCAL_MODELS_URL` for that id. `--timeout` is the wait for one reply (default 180 seconds, which is long enough for a reasoning model). `model list` and `model remove` edit the same file. On a single-file bind mount the write falls back to an in-place update, the same way root keys do.
+
+```python
+resp = bedrock.converse(
+    modelId="qwythos-9b",
+    messages=[{"role": "user", "content": [{"text": "Hello from MiniStack!"}]}],
+)
+```
+
+A model id that is not in the file still uses `MINISTACK_BEDROCK_PROXY_URL` when that is set, and the mock otherwise. If the local server is down, the call falls back to the mock. When the server returns a reasoning trace and an empty answer, because the token budget ran out while the model was thinking, that trace is the Bedrock reply. When both are present, the answer is the reply.
+
+Note: token counts are a chars/4 heuristic when the upstream server does not report usage. The counts are shape-correct. Do not assert on exact counts against the mock.
 
 ---
 
@@ -1000,8 +1022,11 @@ When Docker is available, `StartApplication` for a `FLINK-1_19` or `FLINK-1_20` 
 | `MINISTACK_SSL_CERT` | _(unset)_ | Optional PEM-encoded server certificate path; required together with `MINISTACK_SSL_KEY`. When unset, MiniStack auto-generates a self-signed cert under `${TMPDIR}/ministack-tls/` (cached across restarts) |
 | `MINISTACK_SSL_KEY` | _(unset)_ | Optional PEM-encoded private key path; required together with `MINISTACK_SSL_CERT` |
 | `MINISTACK_IMDS_V2_REQUIRED` | `0` | Reject token-less GETs on `/latest/meta-data/...`. When set, callers must first `PUT /latest/api/token` and pass the token as `X-aws-ec2-metadata-token`, matching real-AWS hop-limit-1 IMDSv2-only instances |
-| `MINISTACK_BEDROCK_PROXY_URL` | _(unset)_ | OpenAI-compatible `/chat/completions` endpoint (Ollama, llama.cpp, vLLM). When set, Bedrock `Converse`/`InvokeModel` prompts are translated to OpenAI shape, forwarded, and translated back to Bedrock shape — real completions through the Bedrock API. Falls back to the deterministic mock on connection error |
-| `MINISTACK_BEDROCK_PROXY_TIMEOUT_SECONDS` | `30` | Upstream request timeout for the Bedrock proxy |
+| `MINISTACK_BEDROCK_PROXY_URL` | _(unset)_ | OpenAI-compatible `/chat/completions` endpoint (Ollama, llama.cpp, vLLM). When set, Bedrock `Converse`/`InvokeModel` prompts for model ids that are not in `local-models.json` are translated to OpenAI shape, forwarded, and translated back to Bedrock shape. Falls back to the deterministic mock on connection error |
+| `MINISTACK_BEDROCK_PROXY_TIMEOUT_SECONDS` | `30` | Upstream request timeout for `MINISTACK_BEDROCK_PROXY_URL` |
+| `LOCAL_MODELS_FILE` | `local-models.json` | JSON object of Bedrock model id to `{model, url, name, timeoutSeconds}`. Listed by `ListFoundationModels`. Each id is forwarded to its own server. `ministack model set` writes this file |
+| `LOCAL_MODELS_URL` | _(unset)_ | Default server for a local model entry that has no `url`. No path: MiniStack appends `/v1/chat/completions` |
+| `LOCAL_MODELS_TIMEOUT_SECONDS` | `180` | Wait for one reply from a local model when the entry has no `timeoutSeconds` |
 | `MINISTACK_MSK_BOOTSTRAP` | _(unset)_ | Plaintext bootstrap broker string returned by MSK `GetBootstrapBrokers` — point it at a real broker you bring (Redpanda, Kafka, KRaft). Unset → placeholder endpoint (control-plane only) |
 | `MINISTACK_MSK_BOOTSTRAP_TLS` | _(unset)_ | TLS bootstrap string (`BootstrapBrokerStringTls`) |
 | `MINISTACK_MSK_BOOTSTRAP_SASL_SCRAM` | _(unset)_ | SASL/SCRAM bootstrap string (`BootstrapBrokerStringSaslScram`) |

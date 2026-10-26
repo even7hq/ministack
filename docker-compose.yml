@@ -13,6 +13,10 @@ services:
       # ({"gio": "secret"}), which is gitignored.
       - ROOT_AUTH=true
       - ROOT_KEYS_FILE=/var/lib/ministack/root-keys.json
+      # Local model ids. ./local-models/ is created on first up.
+      # Register one with: python -m ministack model set <id> --model <upstream>
+      - LOCAL_MODELS_FILE=/var/lib/ministack/local-models/local-models.json
+      - LOCAL_MODELS_URL=http://ollama:11434
       # Turn the check off for this service with:
       #   command: ["--no-root-auth"]
       - S3_PERSIST=0
@@ -27,6 +31,7 @@ services:
       - MINISTACK_IMDS_LISTENER_HOST_SCRIPT=${PWD}/scripts/ImdsLinkLocalListener.py
     volumes:
       - ./root-keys.json:/var/lib/ministack/root-keys.json
+      - ./local-models:/var/lib/ministack/local-models
       - ./data/s3:/tmp/ministack-data/s3
       - ./scripts:/opt/ministack/scripts:ro
       - /var/run/docker.sock:/var/run/docker.sock
@@ -39,6 +44,19 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+    restart: unless-stopped
+
+  # Opt in with: docker compose --profile models up -d
+  # The image uses the NVIDIA GPU when the host driver and nvidia-container-toolkit
+  # are installed. Without them, Ollama serves the same models on CPU.
+  ollama:
+    profiles: ["models"]
+    image: ollama/ollama:latest
+    container_name: ministack-ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ./data/ollama:/root/.ollama
     restart: unless-stopped
 
   redis:

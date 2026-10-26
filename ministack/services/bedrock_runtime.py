@@ -27,6 +27,9 @@ Behavior:
     reachable, the prompt is translated to OpenAI shape, forwarded, and the
     response translated back to Converse shape. Falls back to mock silently
     on connection error.
+  Local models: local-models.json registers Bedrock model ids that
+    ListFoundationModels returns and that Converse sends to their own
+    OpenAI-compatible server. A local entry wins over the proxy URL.
 
 Token counts are a heuristic (chars/4) — shape-correct, absolute counts are
 approximate. Documented in release notes; users asserting on exact counts
@@ -326,15 +329,32 @@ def _openai_messages(messages, system):
     return out
 
 
+def _chat_completions_target(model_id: str):
+    """Return ``(base_url, upstream_model, timeout)`` or ``None``.
+
+    A local-models.json entry wins for its own id. Otherwise every model goes
+    to ``MINISTACK_BEDROCK_PROXY_URL`` when that is set.
+    """
+    from ministack.core.local_models import resolve_local_model
+    local = resolve_local_model(model_id)
+    if local is not None:
+        return local
+    if _PROXY_URL:
+        return _PROXY_URL, model_id, _PROXY_TIMEOUT_S
+    return None
+
+
 def _proxy_openai_chat_message(model_id: str, messages, system, inference_config,
                                tool_config=None):
-    """Forward to MINISTACK_BEDROCK_PROXY_URL in OpenAI chat-completions shape
-    and return the assistant message object with the proxy's (input, output)
-    token counts, or (None, None) on any failure (the caller falls back to the mock)."""
-    if not _PROXY_URL:
+    """Forward in OpenAI chat-completions shape and return the assistant
+    message with the server's (input, output) token counts, or (None, None)
+    when nothing is configured or the call fails (the caller uses the mock)."""
+    target = _chat_completions_target(model_id)
+    if target is None:
         return None, None
+    base_url, upstream, timeout = target
     payload = {
-        "model": model_id,
+        "model": upstream,
         "messages": _openai_messages(messages, system),
         "stream": False,
     }
@@ -353,13 +373,13 @@ def _proxy_openai_chat_message(model_id: str, messages, system, inference_config
         if "stopSequences" in inference_config:
             payload["stop"] = inference_config["stopSequences"]
     req = urllib.request.Request(
-        f"{_PROXY_URL}/v1/chat/completions",
+        f"{base_url}/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=_PROXY_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.load(resp)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
         logger.debug("bedrock proxy unreachable, falling back to mock: %s", e)
@@ -382,6 +402,23 @@ def _proxy_openai_chat_message(model_id: str, messages, system, inference_config
     return message, counts
 
 
+def _assistant_text(message) -> str:
+    """The reply text from an OpenAI chat message.
+
+    Ollama puts a reasoning model's chain of thought in ``reasoning`` and the
+    answer in ``content``. When the token budget runs out during the thought,
+    ``content`` is empty. The thought is the reply in that case.
+    """
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        return content
+    for key in ("reasoning", "reasoning_content"):
+        reasoning = message.get(key)
+        if isinstance(reasoning, str) and reasoning:
+            return reasoning
+    return ""
+
+
 def _converse_blocks_from_message(message):
     """The assistant content blocks for an OpenAI message, plus the stop reason.
 
@@ -389,8 +426,8 @@ def _converse_blocks_from_message(message):
     a tool stops with tool_use rather than end_turn.
     """
     blocks, stop_reason = [], "end_turn"
-    text = message.get("content")
-    if isinstance(text, str) and text:
+    text = _assistant_text(message)
+    if text:
         blocks.append({"text": text})
     for index, call in enumerate(message.get("tool_calls") or []):
         function = (call or {}).get("function") or {}
@@ -418,8 +455,7 @@ def _proxy_to_openai_chat(model_id: str, messages, system, inference_config) -> 
     message, _ = _proxy_openai_chat_message(model_id, messages, system, inference_config)
     if message is None:
         return None
-    content = message.get("content")
-    return content if isinstance(content, str) else None
+    return _assistant_text(message) or None
 
 
 # ---------------------------------------------------------------------------
@@ -1329,22 +1365,27 @@ def _openai_mock_reply(model_id, messages) -> str:
 
 
 def _proxy_openai_passthrough(payload: dict):
-    """Forward a raw OpenAI chat-completions payload to the configured proxy.
-    Returns the assistant text, or None on no-proxy / failure (caller mocks)."""
-    if not _PROXY_URL:
+    """Forward a raw OpenAI chat-completions payload.
+    Returns the assistant text, or None when nothing is configured or the call
+    fails (the caller uses the mock)."""
+    model_id = payload.get("model") if isinstance(payload, dict) else None
+    target = _chat_completions_target(model_id if isinstance(model_id, str) else "")
+    if target is None:
         return None
+    base_url, upstream, timeout = target
     fwd = dict(payload)
+    fwd["model"] = upstream
     fwd["stream"] = False
     req = urllib.request.Request(
-        f"{_PROXY_URL}/v1/chat/completions",
+        f"{base_url}/v1/chat/completions",
         data=json.dumps(fwd).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=_PROXY_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.load(resp)
-        return data["choices"][0]["message"]["content"]
+        return _assistant_text(data["choices"][0]["message"]) or None
     except Exception:
         logger.debug("openai proxy unreachable/malformed, falling back to mock")
         return None

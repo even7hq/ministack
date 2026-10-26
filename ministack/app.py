@@ -3814,6 +3814,8 @@ def _pid_file(port: int) -> str:
 
 
 def main():
+    from ministack.core.local_models import add_parser as add_model_parser
+    from ministack.core.local_models import execute as execute_model
     from ministack.core.root_keys import add_parser as add_root_key_parser
     from ministack.core.root_keys import execute as execute_root_key
 
@@ -3825,11 +3827,15 @@ def main():
         action="store_true",
         help="Accept unsigned requests as the account root. Overrides ROOT_AUTH=true.",
     )
-    add_root_key_parser(parser.add_subparsers(dest="command"))
+    commands = parser.add_subparsers(dest="command")
+    add_root_key_parser(commands)
+    add_model_parser(commands)
     args = parser.parse_args()
-    # Writing a key must not start the server or import the HTTP stack.
+    # Writing a key or a model must not start the server or import the HTTP stack.
     if args.command == "root-key":
         raise SystemExit(execute_root_key(args))
+    if args.command == "model":
+        raise SystemExit(execute_model(args))
 
     from hypercorn.asyncio import serve as hypercorn_serve
     from hypercorn.config import Config as HypercornConfig

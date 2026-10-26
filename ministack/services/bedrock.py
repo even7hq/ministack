@@ -398,6 +398,10 @@ def _find_model(identifier: str):
     for entry in _CATALOG:
         if entry[0] == identifier:
             return entry
+    from ministack.core.local_models import catalog_entries
+    for entry in catalog_entries():
+        if entry[0] == identifier:
+            return entry
     return None
 
 
@@ -417,6 +421,21 @@ def _list_foundation_models(query_params) -> tuple:
             continue
         if by_customization:
             # No catalog model supports customization in mock — filter all out
+            continue
+        summaries.append(_model_summary(*entry))
+    from ministack.core.local_models import catalog_entries
+    seen = {summary["ModelId"] for summary in summaries}
+    for entry in catalog_entries():
+        model_id, _, provider, _, outputs, _ = entry
+        if model_id in seen:
+            continue
+        if by_provider and provider.lower() != by_provider.lower():
+            continue
+        if by_output and by_output.upper() not in outputs:
+            continue
+        if by_inference and by_inference.upper() != "ON_DEMAND":
+            continue
+        if by_customization:
             continue
         summaries.append(_model_summary(*entry))
     return _json({"ModelSummaries": summaries})

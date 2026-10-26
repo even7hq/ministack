@@ -50,6 +50,7 @@ data/
 .env
 .env.local
 root-keys.json
+local-models/
 *.pem
 *.key
 
