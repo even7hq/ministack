@@ -329,6 +329,23 @@ def _openai_messages(messages, system):
     return out
 
 
+def _model_is_served(model_id: str) -> bool:
+    """False when local models are registered and this id is not one of them.
+
+    With no registry, every id still gets the built-in mock. The proxy URL
+    counts as serving the id, because that URL receives every model that is
+    not in the registry.
+    """
+    from ministack.core.local_models import serves_builtin_catalog
+    if serves_builtin_catalog():
+        return True
+    return _chat_completions_target(model_id) is not None
+
+
+def _unknown_model_error(model_id: str) -> tuple:
+    return _error("ValidationException", f"Could not find model with ID {model_id}.", 404)
+
+
 def _chat_completions_target(model_id: str):
     """Return ``(base_url, upstream_model, timeout)`` or ``None``.
 
@@ -529,6 +546,8 @@ def _converse(model_id: str, headers, body) -> tuple:
         model_id, messages, system, inference_config, tool_config)
     blocks, stop_reason = ([], "end_turn")
     if message is None:
+        if not _model_is_served(model_id):
+            return _unknown_model_error(model_id)
         text = _mock_reply(model_id, messages, system)
     else:
         blocks, stop_reason = _converse_blocks_from_message(message)
@@ -704,6 +723,8 @@ def _converse_stream(model_id: str, headers, body) -> tuple:
         message, counts = _proxy_openai_chat_message(
             model_id, messages, system, inference_config, body_obj.get("toolConfig"))
         if message is None:
+            if not _model_is_served(model_id):
+                return _unknown_model_error(model_id)
             text = _mock_reply(model_id, messages, system)
         else:
             blocks, proxied_stop = _converse_blocks_from_message(message)
@@ -871,6 +892,8 @@ def _invoke_model(model_id: str, headers, body) -> tuple:
         body_obj.get("inferenceConfig"),
     )
     if reply is None:
+        if not _model_is_served(model_id):
+            return _unknown_model_error(model_id)
         reply = _mock_reply(model_id, [
             {"role": "user", "content": [{"text": prompt}]},
         ], [])
@@ -1006,6 +1029,8 @@ def _invoke_model_with_response_stream(model_id: str, headers, body) -> tuple:
         body_obj.get("inferenceConfig"),
     )
     if reply is None:
+        if not _model_is_served(model_id):
+            return _unknown_model_error(model_id)
         reply = _mock_reply(model_id, [
             {"role": "user", "content": [{"text": prompt}]},
         ], [])
@@ -1538,6 +1563,12 @@ def _openai_chat_completion(headers, body) -> tuple:
     except _UpstreamModelError as exc:
         return _openai_error(str(exc), status=exc.status)
     if text is None:
+        if not _model_is_served(model_id):
+            return _openai_error(
+                f"The model '{model_id}' does not exist.",
+                code="model_not_found",
+                status=404,
+            )
         text = _openai_mock_reply(model_id, messages)
     if body_obj.get("stream") is True:
         return 200, {

@@ -391,11 +391,17 @@ def _foundation_model_id_from_identifier(identifier: str) -> str | None:
     return model_id
 
 
+def _builtin_catalog():
+    """The AWS mock ids, or nothing once local models are what this process serves."""
+    from ministack.core.local_models import serves_builtin_catalog
+    return _CATALOG if serves_builtin_catalog() else []
+
+
 def _find_model(identifier: str):
     identifier = _foundation_model_id_from_identifier(identifier)
     if not identifier:
         return None
-    for entry in _CATALOG:
+    for entry in _builtin_catalog():
         if entry[0] == identifier:
             return entry
     from ministack.core.local_models import catalog_entries
@@ -411,7 +417,7 @@ def _list_foundation_models(query_params) -> tuple:
     by_inference = (query_params.get("byInferenceType") or [None])[0] if isinstance(query_params, dict) else None
     by_customization = (query_params.get("byCustomizationType") or [None])[0] if isinstance(query_params, dict) else None
     summaries = []
-    for entry in _CATALOG:
+    for entry in _builtin_catalog():
         model_id, _, provider, inputs, outputs, _ = entry
         if by_provider and provider.lower() != by_provider.lower():
             continue
@@ -522,7 +528,7 @@ def _list_inference_profiles(query_params) -> tuple:
     profiles = []
     # System-defined: built from catalog + region prefixes
     if not type_filter or type_filter == "SYSTEM_DEFINED":
-        for entry in _CATALOG:
+        for entry in _builtin_catalog():
             model_id, model_name, provider, inputs, outputs, streaming = entry
             if not streaming:
                 continue
@@ -551,7 +557,7 @@ def _get_inference_profile(identifier: str) -> tuple:
     for prefix in _INFERENCE_PROFILE_PREFIXES:
         if identifier.startswith(f"{prefix}."):
             model_id = identifier[len(prefix) + 1:]
-            for entry in _CATALOG:
+            for entry in _builtin_catalog():
                 if entry[0] == model_id:
                     return _json({
                         "InferenceProfileName": f"{prefix.upper()} {entry[1]}",

@@ -81,7 +81,7 @@ def test_bad_file_is_ignored_on_the_request_path(tmp_path, monkeypatch):
 
 
 def test_local_model_is_listed_and_forwarded(tmp_path, monkeypatch):
-    """The id shows up in the catalog and Converse posts the upstream name."""
+    """The id is the only catalog row, and Converse posts the upstream name."""
     path = tmp_path / "local-models.json"
     path.write_text(json.dumps({
         "qwythos-9b": {
@@ -104,7 +104,7 @@ def test_local_model_is_listed_and_forwarded(tmp_path, monkeypatch):
     _status, _headers, body = _list_foundation_models({})
     ids = [row["modelId"] for row in json.loads(body)["modelSummaries"]]
     assert "qwythos-9b" in ids
-    assert "anthropic.claude-3-5-sonnet-20241022-v2:0" in ids
+    assert "anthropic.claude-3-5-sonnet-20241022-v2:0" not in ids
 
     captured = {}
 
@@ -151,6 +151,52 @@ def test_local_model_is_listed_and_forwarded(tmp_path, monkeypatch):
     text = _proxy_openai_passthrough({"model": "qwythos-9b", "messages": []})
     assert text == "hi"
     assert captured["body"]["model"] == "qwythos"
+
+
+def test_proxy_url_keeps_the_builtin_catalog(tmp_path, monkeypatch):
+    """The proxy still receives every id, so the AWS list stays beside the local one."""
+    path = tmp_path / "local-models.json"
+    path.write_text(json.dumps({
+        "qwythos-9b": {"url": "http://models.internal:11434"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("LOCAL_MODELS_FILE", str(path))
+    monkeypatch.setenv("MINISTACK_BEDROCK_PROXY_URL", "http://proxy.internal:11434")
+
+    from ministack.services.bedrock import _list_foundation_models
+
+    _status, _headers, body = _list_foundation_models({})
+    ids = [row["modelId"] for row in json.loads(body)["modelSummaries"]]
+    assert "qwythos-9b" in ids
+    assert "anthropic.claude-3-5-sonnet-20241022-v2:0" in ids
+
+
+def test_unknown_model_is_rejected_when_local_models_are_registered(tmp_path, monkeypatch):
+    """Claude is not a mock reply once this process has named the models it runs."""
+    path = tmp_path / "local-models.json"
+    path.write_text(json.dumps({
+        "qwythos-9b": {"url": "http://models.internal:11434"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("LOCAL_MODELS_FILE", str(path))
+    monkeypatch.delenv("MINISTACK_BEDROCK_PROXY_URL", raising=False)
+
+    from ministack.services.bedrock_runtime import _converse, _openai_chat_completion
+
+    status, _headers, body = _openai_chat_completion({}, json.dumps({
+        "model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode())
+    assert status == 404
+    assert b"prompt#" not in body
+
+    status, _headers, body = _converse(
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        {},
+        json.dumps({
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+        }).encode(),
+    )
+    assert status == 404
+    assert b"ministack mock" not in body
 
 
 def test_system_message_is_moved_before_the_conversation(tmp_path, monkeypatch):

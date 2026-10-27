@@ -136,6 +136,18 @@ def resolve_local_model(model_id: str) -> tuple[str, str, float] | None:
     return url, upstream, timeout
 
 
+def serves_builtin_catalog() -> bool:
+    """Whether ``ListFoundationModels`` still includes the AWS mock ids.
+
+    A registry names the models this process runs. Listing Claude, Nova and
+    the rest beside them offers models that are not available. The proxy URL
+    forwards every other id, so the mock catalog stays when that URL is set.
+    """
+    if os.environ.get("MINISTACK_BEDROCK_PROXY_URL", "").strip():
+        return True
+    return not catalog_entries()
+
+
 def catalog_entries() -> list[tuple]:
     """Foundation-model rows for ids in the local file.
 
