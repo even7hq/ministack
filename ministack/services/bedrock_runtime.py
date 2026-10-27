@@ -1364,10 +1364,72 @@ def _openai_mock_reply(model_id, messages) -> str:
     return f"[ministack mock {_family(model_id)} {model_id}] reply for prompt#{digest}"
 
 
+def _hoist_system_messages(messages):
+    """One system message at the front, then the rest of the conversation.
+
+    Qwen-family templates, Qwythos included, abort when a system message is
+    not the first message. Clients append instructions later in the list.
+    Those texts are joined into the opening system message. A payload that
+    already starts with its only system message is left as it arrived.
+    """
+    if not isinstance(messages, list):
+        return messages
+    systems = []
+    rest = []
+    for message in messages:
+        role = message.get("role") if isinstance(message, dict) else None
+        if isinstance(role, str) and role.strip().lower() in ("system", "developer"):
+            systems.append(message)
+        else:
+            rest.append(message)
+    if not systems:
+        return messages
+    # One string. Ollama splits a list of text parts into one message per
+    # part and keeps the role, so two parts of a system message become two
+    # system messages and Qwythos aborts.
+    if (
+        len(systems) == 1
+        and messages[0] is systems[0]
+        and isinstance(systems[0].get("content"), str)
+    ):
+        return messages
+    text = "\n\n".join(
+        _openai_flatten_content(message.get("content")) for message in systems
+    )
+    return [{"role": "system", "content": text}, *rest]
+
+
+class _UpstreamModelError(Exception):
+    """A configured model was called and did not return a completion.
+
+    The mock is only for a model id with no server. Once the call left
+    MiniStack, a failure has to reach the client as that failure.
+    """
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def _upstream_error_text(raw: bytes, fallback: str) -> str:
+    text = raw.decode("utf-8", "replace").strip()
+    try:
+        parsed = json.loads(text) if text else None
+    except json.JSONDecodeError:
+        return text or fallback
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict) and error.get("message"):
+        return str(error["message"])
+    return text or fallback
+
+
 def _proxy_openai_passthrough(payload: dict):
     """Forward a raw OpenAI chat-completions payload.
-    Returns the assistant text, or None when nothing is configured or the call
-    fails (the caller uses the mock)."""
+
+    Returns the assistant text, or None when no server is configured for the
+    model (the caller uses the mock). A call that was sent and failed raises
+    ``_UpstreamModelError``.
+    """
     model_id = payload.get("model") if isinstance(payload, dict) else None
     target = _chat_completions_target(model_id if isinstance(model_id, str) else "")
     if target is None:
@@ -1376,6 +1438,8 @@ def _proxy_openai_passthrough(payload: dict):
     fwd = dict(payload)
     fwd["model"] = upstream
     fwd["stream"] = False
+    if "messages" in fwd:
+        fwd["messages"] = _hoist_system_messages(fwd["messages"])
     req = urllib.request.Request(
         f"{base_url}/v1/chat/completions",
         data=json.dumps(fwd).encode("utf-8"),
@@ -1386,9 +1450,14 @@ def _proxy_openai_passthrough(payload: dict):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.load(resp)
         return _assistant_text(data["choices"][0]["message"]) or None
-    except Exception:
-        logger.debug("openai proxy unreachable/malformed, falling back to mock")
-        return None
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:500]
+        logger.warning("local model %s returned %s: %s", model_id, exc.code, detail)
+        status = exc.code if isinstance(exc.code, int) and 400 <= exc.code <= 599 else 502
+        raise _UpstreamModelError(status, _upstream_error_text(detail, f"local model returned {exc.code}")) from exc
+    except Exception as exc:
+        logger.warning("local model %s unreachable: %s", model_id, exc)
+        raise _UpstreamModelError(502, f"local model unreachable: {exc}") from exc
 
 
 def _build_chat_completion(model_id, messages, text) -> dict:
@@ -1464,7 +1533,10 @@ def _openai_chat_completion(headers, body) -> tuple:
         return err
     model_id = body_obj["model"]
     messages = body_obj["messages"]
-    text = _proxy_openai_passthrough(body_obj)
+    try:
+        text = _proxy_openai_passthrough(body_obj)
+    except _UpstreamModelError as exc:
+        return _openai_error(str(exc), status=exc.status)
     if text is None:
         text = _openai_mock_reply(model_id, messages)
     if body_obj.get("stream") is True:

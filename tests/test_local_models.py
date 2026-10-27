@@ -1,10 +1,12 @@
 """Local models are listed by Bedrock and forwarded to their own server."""
 
 import errno
+import io
 import json
 import os
 import subprocess
 import sys
+import urllib.error
 
 import pytest
 
@@ -151,6 +153,148 @@ def test_local_model_is_listed_and_forwarded(tmp_path, monkeypatch):
     assert captured["body"]["model"] == "qwythos"
 
 
+def test_system_message_is_moved_before_the_conversation(tmp_path, monkeypatch):
+    """Qwythos rejects a system message that arrives after a user turn."""
+    path = tmp_path / "local-models.json"
+    path.write_text(json.dumps({
+        "qwythos-9b": {"url": "http://models.internal:11434"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("LOCAL_MODELS_FILE", str(path))
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _n=-1):
+            return json.dumps({
+                "choices": [{"message": {"role": "assistant", "content": "pong"}}],
+            }).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Response()
+
+    monkeypatch.setattr(
+        "ministack.services.bedrock_runtime.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    from ministack.services.bedrock_runtime import _proxy_openai_passthrough
+
+    text = _proxy_openai_passthrough({
+        "model": "qwythos-9b",
+        "messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "system", "content": "Answer briefly."},
+            {"role": "user", "content": "pong?"},
+        ],
+    })
+    assert text == "pong"
+    assert [message["role"] for message in captured["body"]["messages"]] == [
+        "system", "user", "assistant", "user",
+    ]
+    assert captured["body"]["messages"][0]["content"] == "Answer briefly."
+
+
+def test_system_content_parts_are_one_message(tmp_path, monkeypatch):
+    """Ollama turns each text part of a system message into its own system message."""
+    path = tmp_path / "local-models.json"
+    path.write_text(json.dumps({
+        "qwythos-9b": {"url": "http://models.internal:11434"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("LOCAL_MODELS_FILE", str(path))
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _n=-1):
+            return json.dumps({
+                "choices": [{"message": {"role": "assistant", "content": "pong"}}],
+            }).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Response()
+
+    monkeypatch.setattr(
+        "ministack.services.bedrock_runtime.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    from ministack.services.bedrock_runtime import _proxy_openai_passthrough
+
+    text = _proxy_openai_passthrough({
+        "model": "qwythos-9b",
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "You are helpful."},
+                {"type": "text", "text": "Answer with the single word pong."},
+            ]},
+            {"role": "user", "content": "Go."},
+        ],
+    })
+    assert text == "pong"
+    system = captured["body"]["messages"][0]
+    assert system["role"] == "system"
+    assert system["content"] == "You are helpful.\nAnswer with the single word pong."
+    assert [message["role"] for message in captured["body"]["messages"]] == ["system", "user"]
+
+
+def test_capitalized_system_role_is_moved_first(tmp_path, monkeypatch):
+    """Ollama lowercases System and Developer, then Qwythos rejects them in the middle."""
+    path = tmp_path / "local-models.json"
+    path.write_text(json.dumps({
+        "qwythos-9b": {"url": "http://models.internal:11434"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("LOCAL_MODELS_FILE", str(path))
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _n=-1):
+            return json.dumps({
+                "choices": [{"message": {"role": "assistant", "content": "pong"}}],
+            }).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Response()
+
+    monkeypatch.setattr(
+        "ministack.services.bedrock_runtime.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    from ministack.services.bedrock_runtime import _proxy_openai_passthrough
+
+    text = _proxy_openai_passthrough({
+        "model": "qwythos-9b",
+        "messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "System", "content": "Answer with the single word pong."},
+            {"role": "Developer", "content": [{"type": "text", "text": "Be brief."}]},
+            {"role": "user", "content": "Go."},
+        ],
+    })
+    assert text == "pong"
+    assert [message["role"] for message in captured["body"]["messages"]] == [
+        "system", "user", "user",
+    ]
+    assert "pong" in captured["body"]["messages"][0]["content"]
+
+
 def test_reasoning_fills_an_empty_answer():
     """A reasoning model that spent the budget thinking still returns that text."""
     from ministack.services.bedrock_runtime import _converse_blocks_from_message
@@ -168,6 +312,38 @@ def test_reasoning_fills_an_empty_answer():
         "reasoning": "The reply is pong.",
     })
     assert final == [{"text": "pong"}]
+
+
+def test_local_model_http_error_is_not_a_mock(tmp_path, monkeypatch):
+    """A 500 from the model is the client's error, not a fake assistant reply."""
+    path = tmp_path / "local-models.json"
+    path.write_text(json.dumps({
+        "qwythos-9b": {"url": "http://models.internal:11434"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("LOCAL_MODELS_FILE", str(path))
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            500,
+            "err",
+            {},
+            io.BytesIO(b'{"error":{"message":"the request exceeds the available context size"}}'),
+        )
+
+    monkeypatch.setattr(
+        "ministack.services.bedrock_runtime.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    from ministack.services.bedrock_runtime import _openai_chat_completion
+
+    status, _headers, body = _openai_chat_completion({}, json.dumps({
+        "model": "qwythos-9b",
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode())
+    assert status == 500
+    assert b"prompt#" not in body
+    assert b"available context size" in body
 
 
 def test_unregistered_model_is_not_forwarded(monkeypatch):
