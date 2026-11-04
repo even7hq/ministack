@@ -153,6 +153,21 @@ def test_local_model_is_listed_and_forwarded(tmp_path, monkeypatch):
     assert captured["body"]["model"] == "qwythos"
 
 
+def test_catalog_off_lists_nothing_when_the_registry_is_empty(tmp_path, monkeypatch):
+    """off hides the AWS mocks, so an empty registry is an empty model list."""
+    path = tmp_path / "local-models.json"
+    path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("LOCAL_MODELS_FILE", str(path))
+    monkeypatch.delenv("MINISTACK_BEDROCK_PROXY_URL", raising=False)
+    monkeypatch.setenv("MINISTACK_BEDROCK_CATALOG", "off")
+
+    from ministack.services.bedrock import _list_foundation_models
+
+    _status, _headers, body = _list_foundation_models({})
+    ids = [row["modelId"] for row in json.loads(body)["modelSummaries"]]
+    assert ids == []
+
+
 def test_proxy_url_keeps_the_builtin_catalog(tmp_path, monkeypatch):
     """The proxy still receives every id, so the AWS list stays beside the local one."""
     path = tmp_path / "local-models.json"

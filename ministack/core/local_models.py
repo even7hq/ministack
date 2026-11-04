@@ -142,7 +142,13 @@ def serves_builtin_catalog() -> bool:
     A registry names the models this process runs. Listing Claude, Nova and
     the rest beside them offers models that are not available. The proxy URL
     forwards every other id, so the mock catalog stays when that URL is set.
+
+    ``MINISTACK_BEDROCK_CATALOG=off`` hides those mock ids even when the
+    registry is empty, so this process lists no foundation models.
     """
+    flag = os.environ.get("MINISTACK_BEDROCK_CATALOG", "").strip().lower()
+    if flag in {"0", "off", "false", "no"}:
+        return False
     if os.environ.get("MINISTACK_BEDROCK_PROXY_URL", "").strip():
         return True
     return not catalog_entries()

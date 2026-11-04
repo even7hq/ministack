@@ -17,6 +17,9 @@ services:
       # Register one with: python -m ministack model set <id> --model <upstream>
       - LOCAL_MODELS_FILE=/var/lib/ministack/local-models/local-models.json
       - LOCAL_MODELS_URL=http://ollama:11434
+      # Inference goes through LiteLLM. An empty registry would otherwise
+      # bring the Claude/Nova/Llama mocks back.
+      - MINISTACK_BEDROCK_CATALOG=off
       # Turn the check off for this service with:
       #   command: ["--no-root-auth"]
       - S3_PERSIST=0
