@@ -834,6 +834,8 @@ def _run_instances(p):
         iam_profile=iam_profile
     )
 
+    _apply_run_instance_tag_specifications(p, created)
+
     # A registered AMI boots each record as a real container. Unregistered ids
     # — including every invented ami- a CFN or Terraform stack carries — stay
     # metadata-only, so existing workloads are untouched.
@@ -892,23 +894,6 @@ def _run_instances(p):
                 "InternalError",
                 f"failed to start instance from {_esc(image['ImageLocation'])}: "
                 f"{_esc(str(e))}", 500)
-
-    # Process TagSpecifications
-    i = 1
-    while _p(p, f"TagSpecification.{i}.ResourceType"):
-        rtype = _p(p, f"TagSpecification.{i}.ResourceType")
-        spec_tags = []
-        j = 1
-        while _p(p, f"TagSpecification.{i}.Tag.{j}.Key"):
-            spec_tags.append({
-                "Key": _p(p, f"TagSpecification.{i}.Tag.{j}.Key"),
-                "Value": _p(p, f"TagSpecification.{i}.Tag.{j}.Value", ""),
-            })
-            j += 1
-        if rtype == "instance" and spec_tags:
-            for inst in created:
-                _tags[inst["InstanceId"]] = spec_tags[:]
-        i += 1
 
     items = "".join(_instance_xml(i) for i in created)
     inner = f"""<instancesSet>{items}</instancesSet>
@@ -2469,6 +2454,43 @@ def _parse_ec2_docker_flags(flags: str) -> dict:
     return kwargs
 
 
+_DOCKER_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _apply_run_instance_tag_specifications(p, created):
+    """Store RunInstances TagSpecification tags before the container boots.
+
+    The Name tag is the Docker hostname, so it has to exist before _vm_launch.
+    """
+    i = 1
+    while _p(p, f"TagSpecification.{i}.ResourceType"):
+        rtype = _p(p, f"TagSpecification.{i}.ResourceType")
+        spec_tags = []
+        j = 1
+        while _p(p, f"TagSpecification.{i}.Tag.{j}.Key"):
+            spec_tags.append({
+                "Key": _p(p, f"TagSpecification.{i}.Tag.{j}.Key"),
+                "Value": _p(p, f"TagSpecification.{i}.Tag.{j}.Value", ""),
+            })
+            j += 1
+        if rtype == "instance" and spec_tags:
+            for inst in created:
+                _tags[inst["InstanceId"]] = spec_tags[:]
+        i += 1
+
+
+def _instance_docker_hostname(inst):
+    """Return a Docker-safe hostname from the instance Name tag, or None."""
+    for tag in _tags.get(inst["InstanceId"], []) or []:
+        if tag.get("Key") != "Name":
+            continue
+        name = (tag.get("Value") or "").strip()
+        if _DOCKER_HOSTNAME_RE.fullmatch(name):
+            return name
+        return None
+    return None
+
+
 def _vm_launch(inst, image_ref):
     """Boot one instance record as a container. Raises on create/start failure;
     the caller backs the records out and surfaces the error."""
@@ -2513,6 +2535,10 @@ def _vm_launch(inst, image_ref):
             caps.append("NET_ADMIN")
         kwargs["cap_add"] = caps
     kwargs.update(_parse_ec2_docker_flags(EC2_DOCKER_FLAGS))
+    if "hostname" not in kwargs:
+        hostname = _instance_docker_hostname(inst)
+        if hostname:
+            kwargs["hostname"] = hostname
     container = client.containers.run(ref, **kwargs)
     global _docker_in_use
     _docker_in_use = True

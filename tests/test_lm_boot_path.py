@@ -206,6 +206,38 @@ def test_run_instances_persists_lm_tenant_tags(vm_sequential):
     assert by_key[AWS_TENANT_APP_ID_TAG_KEY] == app
 
 
+def test_vm_launch_uses_name_tag_as_docker_hostname(vm_sequential):
+    fake, created = vm_sequential
+    ami = _register_image()
+    iids, _ = _run_instances(ami, count=1, tag_params={
+        "TagSpecification.1.ResourceType": ["instance"],
+        "TagSpecification.1.Tag.1.Key": ["Name"],
+        "TagSpecification.1.Tag.1.Value": ["gio-task-agent"],
+    })
+    created.extend(iids)
+    assert fake._runs[0]["hostname"] == "gio-task-agent"
+
+
+def test_vm_launch_skips_invalid_name_tag_hostname(vm_sequential):
+    fake, created = vm_sequential
+    ami = _register_image()
+    iids, _ = _run_instances(ami, count=1, tag_params={
+        "TagSpecification.1.ResourceType": ["instance"],
+        "TagSpecification.1.Tag.1.Key": ["Name"],
+        "TagSpecification.1.Tag.1.Value": ["Bad_Name"],
+    })
+    created.extend(iids)
+    assert "hostname" not in fake._runs[0]
+
+
+def test_vm_launch_omits_hostname_without_name_tag(vm_sequential):
+    fake, created = vm_sequential
+    ami = _register_image()
+    iids, _ = _run_instances(ami, count=1)
+    created.extend(iids)
+    assert "hostname" not in fake._runs[0]
+
+
 def test_vm_launch_adds_net_admin_for_security_groups(vm_sequential, monkeypatch):
     monkeypatch.setenv("MINISTACK_EC2_SECURITY_GROUPS", "1")
     fake, created = vm_sequential
