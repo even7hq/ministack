@@ -4754,3 +4754,168 @@ def test_ec2_describe_instances_validates_id_format_before_existence(ec2):
     with pytest.raises(ClientError) as exc:
         ec2.describe_instances(InstanceIds=["i-00000000000000000"])
     assert exc.value.response["Error"]["Code"] == "InvalidInstanceID.NotFound"
+
+
+# ── Guest state on the host: EC2_GUEST_STATE_DIR ───────────────────────────
+#
+# The instance container is disposable. MiniStack sweeps it on restart and the
+# container layer goes with it, which is how the Kevin guest lost its Hub
+# database and workspace on 2026-11-25. The contract these tests pin: a guest
+# whose GuestState tag is on gets /home and /data bound from one host
+# directory per instance, and nothing changes for a guest that did not ask.
+
+
+def _launch_tagged(ami, tags):
+    """Launch one container-backed instance with RunInstances tags applied."""
+    params = {
+        "ImageId": [ami],
+        "MinCount": ["1"],
+        "MaxCount": ["1"],
+        "TagSpecification.1.ResourceType": ["instance"],
+    }
+    for index, (key, value) in enumerate(tags.items(), start=1):
+        params[f"TagSpecification.1.Tag.{index}.Key"] = [key]
+        params[f"TagSpecification.1.Tag.{index}.Value"] = [value]
+    resp = ec2mod._run_instances(params)
+    import re as _re
+    return _re.findall(r"<instanceId>(i-[0-9a-f]+)</instanceId>", resp[2].decode())
+
+
+def _host_volumes(run, tmp_path):
+    """The bind sources below the state root, as (host, container) pairs."""
+    out = []
+    for spec in run.get("volumes") or []:
+        host, container = spec.split(":")[:2]
+        if host.startswith(str(tmp_path)):
+            out.append((host, container))
+    return out
+
+
+def test_ec2_guest_state_on_mounts_home_and_data(vm, monkeypatch, tmp_path):
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_GUEST_STATE_DIR", str(tmp_path))
+    ami = _register("example/box:1")
+    iids = _launch_tagged(ami, {"Name": "kevin-ai-agent", "GuestState": "on"})
+    created.extend(iids)
+
+    assert _host_volumes(fake._runs[0], tmp_path) == [
+        (f"{tmp_path}/kevin-ai-agent/home", "/home"),
+        (f"{tmp_path}/kevin-ai-agent/data", "/data"),
+    ]
+    for subdir in ("home", "data"):
+        path = tmp_path / "kevin-ai-agent" / subdir
+        assert path.is_dir()
+        # The bind exposes this mode as /home and /data inside the guest, so it
+        # has to be traversable by the guest user (debian's /home is 0755). 0700
+        # root here locks agent out of /home/agent.
+        assert os.stat(path).st_mode & 0o777 == 0o755
+    # Isolation lives in the parent: only this instance reaches its own
+    # subdirectories.
+    assert os.stat(tmp_path / "kevin-ai-agent").st_mode & 0o777 == 0o700
+
+
+def test_ec2_guest_state_modes_ignore_the_umask(vm, monkeypatch, tmp_path):
+    # os.makedirs applies mode & ~umask, and MiniStack can run under a tight
+    # umask: the explicit chmod is what makes the mode a guarantee.
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_GUEST_STATE_DIR", str(tmp_path))
+    previous = os.umask(0o077)
+    try:
+        ami = _register("example/box:1")
+        iids = _launch_tagged(ami, {"Name": "kevin-ai-agent", "GuestState": "on"})
+        created.extend(iids)
+    finally:
+        os.umask(previous)
+
+    for subdir in ("home", "data"):
+        assert os.stat(tmp_path / "kevin-ai-agent" / subdir).st_mode & 0o777 == 0o755
+    assert os.stat(tmp_path / "kevin-ai-agent").st_mode & 0o777 == 0o700
+    assert _host_volumes(fake._runs[0], tmp_path) == [
+        (f"{tmp_path}/kevin-ai-agent/home", "/home"),
+        (f"{tmp_path}/kevin-ai-agent/data", "/data"),
+    ]
+
+
+def test_ec2_guest_state_off_keeps_the_container_filesystem(vm, monkeypatch, tmp_path):
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_GUEST_STATE_DIR", str(tmp_path))
+    ami = _register("example/box:1")
+    iids = _launch_tagged(ami, {"Name": "scratch-box", "GuestState": "off"})
+    created.extend(iids)
+
+    assert "volumes" not in fake._runs[0]
+    assert not (tmp_path / "scratch-box").exists()
+
+
+def test_ec2_guest_state_absent_tag_keeps_the_container_filesystem(vm, monkeypatch, tmp_path):
+    # Opt-in, not opt-out: nothing that did not ask for a host directory gets one.
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_GUEST_STATE_DIR", str(tmp_path))
+    ami = _register("example/box:1")
+    iids = _launch_tagged(ami, {"Name": "plain-box"})
+    created.extend(iids)
+
+    assert "volumes" not in fake._runs[0]
+    assert not (tmp_path / "plain-box").exists()
+
+
+def test_ec2_guest_state_disabled_root_mounts_nothing(vm, monkeypatch, tmp_path):
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_GUEST_STATE_DIR", "")
+    ami = _register("example/box:1")
+    iids = _launch_tagged(ami, {"Name": "kevin-ai-agent", "GuestState": "on"})
+    created.extend(iids)
+
+    assert "volumes" not in fake._runs[0]
+
+
+def test_ec2_guest_state_sanitizes_an_unsafe_name(vm, monkeypatch, tmp_path):
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_GUEST_STATE_DIR", str(tmp_path))
+    ami = _register("example/box:1")
+    # A Name tag is free text on AWS: it can carry a slash, a space, dots.
+    iids = _launch_tagged(ami, {"Name": "../Kevin AI/box", "GuestState": "on"})
+    created.extend(iids)
+
+    volumes = _host_volumes(fake._runs[0], tmp_path)
+    assert [container for _, container in volumes] == ["/home", "/data"]
+    for host, _ in volumes:
+        relative = os.path.relpath(host, str(tmp_path))
+        directory = relative.split(os.sep)[0]
+        # One safe segment: no separator, no "..", no character a path or
+        # Docker cannot take.
+        assert os.sep not in directory and directory not in ("", ".", "..")
+        assert all(char.islower() or char.isdigit() or char == "-" for char in directory)
+        assert (tmp_path / directory).is_dir()
+
+
+def test_ec2_guest_state_two_guests_never_share_a_directory(vm, monkeypatch, tmp_path):
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_GUEST_STATE_DIR", str(tmp_path))
+    ami = _register("example/box:1")
+    first = _launch_tagged(ami, {"Name": "kevin-ai-agent", "GuestState": "on"})
+    second = _launch_tagged(ami, {"Name": "Kevin_AI-agent", "GuestState": "on"})
+    created.extend(first + second)
+
+    roots = []
+    for run in fake._runs[:2]:
+        hosts = _host_volumes(run, tmp_path)
+        roots.append(os.path.dirname(hosts[0][0]))
+    assert len(set(roots)) == 2
+    # The second name sanitizes to the same slug as the first; the digest of
+    # the raw name is what keeps them apart.
+    assert os.path.basename(roots[0]) == "kevin-ai-agent"
+    assert os.path.basename(roots[1]).startswith("kevin-ai-agent-")
+
+
+def test_ec2_guest_state_keeps_volumes_from_docker_flags(vm, monkeypatch, tmp_path):
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_GUEST_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(ec2mod, "EC2_DOCKER_FLAGS", "-v /srv/shared:/shared:ro")
+    ami = _register("example/box:1")
+    iids = _launch_tagged(ami, {"Name": "kevin-ai-agent", "GuestState": "on"})
+    created.extend(iids)
+
+    volumes = fake._runs[0]["volumes"]
+    assert "/srv/shared:/shared:ro" in volumes
+    assert f"{tmp_path}/kevin-ai-agent/home:/home" in volumes
