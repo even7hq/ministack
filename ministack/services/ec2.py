@@ -91,6 +91,10 @@ DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 # docker-CLI-style flags applied to every instance container (e.g. --privileged
 # for a systemd guest). Parsed by _parse_ec2_docker_flags; --init is refused.
 EC2_DOCKER_FLAGS = os.environ.get("EC2_DOCKER_FLAGS", "")
+# Root of the per-instance host directories bound at /home and /data. Empty
+# keeps the container layer, which is what every guest had before. See
+# _guest_state_volumes.
+EC2_GUEST_STATE_DIR = os.environ.get("EC2_GUEST_STATE_DIR", "")
 
 # AWS instance IDs are i- + 8 or 17 lowercase hex chars — malformed IDs are
 # rejected before any existence check.
@@ -2491,6 +2495,66 @@ def _instance_docker_hostname(inst):
     return None
 
 
+def _instance_tag_value(inst, key):
+    """Value of one tag of this instance, stripped, or "" when absent."""
+    for tag in _tags.get(inst["InstanceId"], []) or []:
+        if tag.get("Key") == key:
+            return (tag.get("Value") or "").strip()
+    return ""
+
+
+def _guest_state_dir_name(inst):
+    """Directory name that holds one instance's state, or None without a Name.
+
+    A Name that is already a Docker hostname is used as is, so the bind matches
+    the container hostname. Anything else is free text on AWS — a slash, a
+    space, "..": it is lowercased, reduced to [a-z0-9-] and suffixed with a
+    digest of the raw Name. The result is always one safe path segment, and two
+    different Names cannot land in the same directory even when they sanitize
+    to the same slug.
+    """
+    raw = _instance_tag_value(inst, "Name")
+    if not raw:
+        return None
+    hostname = _instance_docker_hostname(inst)
+    if hostname:
+        return hostname
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")[:48]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{slug}-{digest}" if slug else digest
+
+
+def _guest_state_volumes(inst):
+    """Host directories bound into the guest so its filesystem outlives it.
+
+    One directory per instance under EC2_GUEST_STATE_DIR: /home keeps the Hub
+    database and the agent configuration, /data keeps the workspace. A guest
+    that did not ask (GuestState absent or off) and an empty root keep the
+    container layer, which is the behavior every guest had before.
+
+    A directory that cannot be created raises: a silently ephemeral guest is
+    the failure this exists to prevent.
+    """
+    if not EC2_GUEST_STATE_DIR:
+        return []
+    if _instance_tag_value(inst, "GuestState").lower() not in ("on", "true", "1", "yes"):
+        return []
+    name = _guest_state_dir_name(inst)
+    if not name:
+        return []
+    root = os.path.join(EC2_GUEST_STATE_DIR, name)
+    volumes = []
+    for subdir in ("home", "data"):
+        path = os.path.join(root, subdir)
+        try:
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        except OSError as err:
+            raise RuntimeError(
+                f"cannot create guest state directory {path}: {err}") from err
+        volumes.append(f"{path}:/{subdir}")
+    return volumes
+
+
 def _vm_launch(inst, image_ref):
     """Boot one instance record as a container. Raises on create/start failure;
     the caller backs the records out and surfaces the error."""
@@ -2535,6 +2599,9 @@ def _vm_launch(inst, image_ref):
             caps.append("NET_ADMIN")
         kwargs["cap_add"] = caps
     kwargs.update(_parse_ec2_docker_flags(EC2_DOCKER_FLAGS))
+    guest_volumes = _guest_state_volumes(inst)
+    if guest_volumes:
+        kwargs["volumes"] = list(kwargs.get("volumes") or []) + guest_volumes
     if "hostname" not in kwargs:
         hostname = _instance_docker_hostname(inst)
         if hostname:
