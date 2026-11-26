@@ -2532,6 +2532,16 @@ def _guest_state_volumes(inst):
     that did not ask (GuestState absent or off) and an empty root keep the
     container layer, which is the behavior every guest had before.
 
+    Two modes, on purpose. The bind exposes the host inode's mode inside the
+    guest, so <name>/home and <name>/data are 0755 — the same mode Debian gives
+    /home — or the guest user cannot traverse them to reach /home/agent and
+    /data/luckymaker-workspace. Isolation is one level up: EC2_GUEST_STATE_DIR
+    and <name>/ are 0700, so a guest (which only mounts its own two subpaths)
+    and every other local user stay out.
+
+    os.makedirs applies mode & ~umask, and MiniStack may run under a tight
+    umask, so every directory is chmod'ed explicitly after creation.
+
     A directory that cannot be created raises: a silently ephemeral guest is
     the failure this exists to prevent.
     """
@@ -2544,14 +2554,20 @@ def _guest_state_volumes(inst):
         return []
     root = os.path.join(EC2_GUEST_STATE_DIR, name)
     volumes = []
-    for subdir in ("home", "data"):
-        path = os.path.join(root, subdir)
-        try:
-            os.makedirs(path, mode=0o700, exist_ok=True)
-        except OSError as err:
-            raise RuntimeError(
-                f"cannot create guest state directory {path}: {err}") from err
-        volumes.append(f"{path}:/{subdir}")
+    try:
+        # The root and the per-instance directory are the isolation boundary;
+        # both stay 0700 even when something loosened them before.
+        for directory in (EC2_GUEST_STATE_DIR, root):
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            os.chmod(directory, 0o700)
+        for subdir in ("home", "data"):
+            path = os.path.join(root, subdir)
+            os.makedirs(path, mode=0o755, exist_ok=True)
+            os.chmod(path, 0o755)
+            volumes.append(f"{path}:/{subdir}")
+    except OSError as err:
+        raise RuntimeError(
+            f"cannot create guest state directory under {root}: {err}") from err
     return volumes
 
 

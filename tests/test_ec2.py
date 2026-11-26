@@ -4805,8 +4805,35 @@ def test_ec2_guest_state_on_mounts_home_and_data(vm, monkeypatch, tmp_path):
     for subdir in ("home", "data"):
         path = tmp_path / "kevin-ai-agent" / subdir
         assert path.is_dir()
-        # 0700: another guest has no business reading this one's directory.
-        assert os.stat(path).st_mode & 0o777 == 0o700
+        # The bind exposes this mode as /home and /data inside the guest, so it
+        # has to be traversable by the guest user (debian's /home is 0755). 0700
+        # root here locks agent out of /home/agent.
+        assert os.stat(path).st_mode & 0o777 == 0o755
+    # Isolation lives in the parent: only this instance reaches its own
+    # subdirectories.
+    assert os.stat(tmp_path / "kevin-ai-agent").st_mode & 0o777 == 0o700
+
+
+def test_ec2_guest_state_modes_ignore_the_umask(vm, monkeypatch, tmp_path):
+    # os.makedirs applies mode & ~umask, and MiniStack can run under a tight
+    # umask: the explicit chmod is what makes the mode a guarantee.
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_GUEST_STATE_DIR", str(tmp_path))
+    previous = os.umask(0o077)
+    try:
+        ami = _register("example/box:1")
+        iids = _launch_tagged(ami, {"Name": "kevin-ai-agent", "GuestState": "on"})
+        created.extend(iids)
+    finally:
+        os.umask(previous)
+
+    for subdir in ("home", "data"):
+        assert os.stat(tmp_path / "kevin-ai-agent" / subdir).st_mode & 0o777 == 0o755
+    assert os.stat(tmp_path / "kevin-ai-agent").st_mode & 0o777 == 0o700
+    assert _host_volumes(fake._runs[0], tmp_path) == [
+        (f"{tmp_path}/kevin-ai-agent/home", "/home"),
+        (f"{tmp_path}/kevin-ai-agent/data", "/data"),
+    ]
 
 
 def test_ec2_guest_state_off_keeps_the_container_filesystem(vm, monkeypatch, tmp_path):
