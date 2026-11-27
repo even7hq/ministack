@@ -217,15 +217,19 @@ SERVICE_LABELS = (
 )
 
 
-def reap_all(docker_client, stop_timeout: int = 2, include_unlabelled: bool = False) -> int:
+def reap_all(docker_client, stop_timeout: int = 2, include_unlabelled: bool = False,
+             protected=()) -> int:
     """Remove every MiniStack container, whatever its state.
 
-    For process boundaries only — boot and shutdown. At boot any surviving
-    container **of ours** is by definition an orphan of a dead process: we hold
-    the gateway port now, so whichever process created them is gone (persistence
-    strips container ids from snapshots, so nothing can still own one). At
-    shutdown everything is going away regardless. Neither assumption holds while
-    the process is live, which is why :func:`reap_abandoned` exists separately
+    For process boundaries only — boot and shutdown. At boot a surviving
+    container **of ours** is an orphan of a dead process only when no persisted
+    record still owns it: we hold the gateway port now, so whichever process
+    created them is gone, but with ``PERSIST_STATE=1`` a running EC2 guest is
+    still a live resource whose container id was stripped from the snapshot.
+    Boot therefore passes ``protected`` — container ids and names read back from
+    persisted state — so adoption can reattach those guests. At shutdown
+    everything is going away regardless. Neither assumption holds while the
+    process is live, which is why :func:`reap_abandoned` exists separately
     and is far more conservative.
 
     Scoped by ``ministack.instance`` but *not* by boot nonce — the whole point is
@@ -240,10 +244,16 @@ def reap_all(docker_client, stop_timeout: int = 2, include_unlabelled: bool = Fa
     service label but *no* instance label — those predate this scheme and cannot
     be attributed to anyone. Boot uses it, because holding the gateway port means
     any such leftover is ours to clean; shutdown does not.
+
+    ``protected`` is a set of container ids/names that a persisted record still
+    owns. It is deliberately a plain set rather than a service-aware callback:
+    the boot sweep must work even when persistence cannot be restored, and a
+    caller can always compute the refs from the snapshot before the sweep runs.
     """
     if docker_client is None:
         return 0
     mine = instance_id()
+    protected = set(protected or ())
     seen, targets = set(), []
 
     def _collect(selector, accept):
@@ -254,6 +264,9 @@ def reap_all(docker_client, stop_timeout: int = 2, include_unlabelled: bool = Fa
             logger.warning("reap_all: listing %s failed: %s", selector, exc)
             return
         for c in found:
+            name = getattr(c, "name", "") or ""
+            if c.id in protected or (name and name in protected):
+                continue              # a persisted owner is not an orphan
             if c.id in seen or not accept(c):
                 continue
             seen.add(c.id)

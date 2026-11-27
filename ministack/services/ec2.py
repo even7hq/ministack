@@ -76,7 +76,7 @@ import uuid
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
-from ministack.core import container_reaper
+from ministack.core import container_reaper, persistence as _persistence
 from ministack.core.concurrency import resource_lock, run_offloop
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -85,6 +85,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     new_uuid,
+    request_scope,
 )
 
 logger = logging.getLogger("ec2")
@@ -345,10 +346,18 @@ def _restore_vpc_peering_store(restored):
 
 
 def load_persisted_state(data):
-    return _restore_state(data)
+    """Restore the records, then reattach their containers before serving.
+
+    ``_restore_state`` still has its old, conservative reconciliation for direct
+    callers; the persistence contract uses the adoptive path because a running
+    record in a snapshot is still a live guest, not an instance-store box whose
+    root disk vanished with the process.
+    """
+    _restore_state(data, reconcile=False)
+    finalize_restored_instances()
 
 
-def _restore_state(data):
+def _restore_state(data, reconcile=True):
     if not data:
         return
     _clear_state()
@@ -387,7 +396,8 @@ def _restore_state(data):
     _restore_regional_store(_images, data.get("images", {}))
     if "default_initialized_scopes" not in data:
         _infer_default_initialized_scopes_from_restored_stores()
-    _reconcile_backed_instances_after_restore()
+    if reconcile:
+        _reconcile_backed_instances_after_restore()
 
 
 def _reconcile_backed_instances_after_restore():
@@ -399,11 +409,100 @@ def _reconcile_backed_instances_after_restore():
         if inst.get("VmManager") != "docker":
             continue
         if inst.get("State", {}).get("Name") in ("running", "stopped"):
-            inst["State"] = {"Code": 48, "Name": "terminated"}
-            inst["_terminated_at"] = time.time()
-            inst.pop("_container_id", None)
-            inst.pop("_container_name", None)
-            inst.pop("_ssm_managed", None)
+            _terminate_lost_instance(inst)
+
+
+def _terminate_lost_instance(inst):
+    """AWS semantics for a container-backed box we cannot bring back."""
+    inst["State"] = {"Code": 48, "Name": "terminated"}
+    inst["_terminated_at"] = time.time()
+    inst.pop("_container_id", None)
+    inst.pop("_container_name", None)
+    inst.pop("_ssm_managed", None)
+
+
+def boot_protected_container_refs():
+    """Container ids/names a persisted instance record still owns.
+
+    Called before the boot sweep, because ``get_state`` strips container handles:
+    the only stable identity left is the container name derived from the instance
+    id and its account/region scope. A stopped instance's exited container is
+    protected too — StartInstances can still bring it back.
+    """
+    data = _persistence.load_state("ec2")
+    if not data:
+        return set()
+    records = AccountRegionScopedDict()
+    _restore_regional_store(records, data.get("instances", {}))
+    refs = set()
+    for (account, region, _key), inst in records.all_items():
+        if not isinstance(inst, dict) or inst.get("VmManager") != "docker":
+            continue
+        if inst.get("State", {}).get("Name") not in ("running", "stopped"):
+            continue
+        refs.add(_ec2_container_name(inst["InstanceId"], account, region))
+        for key in ("_container_id", "_container_name"):
+            if inst.get(key):
+                refs.add(inst[key])
+    return refs
+
+
+def finalize_restored_instances(client=None):
+    """Reattach restored guests to their containers, or start missing ones.
+
+    This is the generic boot repair: a ``running`` record in persisted state is
+    still a live instance, so its container is adopted when it survived the
+    process boundary and recreated with the same GuestState bind mounts when it
+    did not. Only a guest that cannot be brought back is reported terminated.
+    """
+    client = client if client is not None else _get_docker()
+    if client is None:
+        return
+    network = _get_ministack_network(client) or os.environ.get("DOCKER_NETWORK") or None
+    for (account, region, iid), inst in _instances.all_items():
+        if not isinstance(inst, dict) or inst.get("VmManager") != "docker":
+            continue
+        state = (inst.get("State") or {}).get("Name")
+        if state not in ("running", "stopped"):
+            continue
+        with request_scope(account, region):
+            name = _ec2_container_name(iid)
+            container = None
+            for ref in (inst.get("_container_id"), inst.get("_container_name"), name):
+                if not ref:
+                    continue
+                try:
+                    container = client.containers.get(ref)
+                    break
+                except Exception:
+                    continue
+            if container is None:
+                if state != "running":
+                    continue
+                image = _registered_image(inst.get("ImageId"))
+                if image is None:
+                    logger.warning("EC2: no registered image for restored instance %s", iid)
+                    _terminate_lost_instance(inst)
+                    continue
+                try:
+                    _vm_launch(inst, image["ImageLocation"])
+                    logger.info("EC2: relaunched restored instance %s in container %s", iid, name)
+                except Exception as exc:
+                    logger.warning("EC2: could not relaunch restored instance %s: %s", iid, exc)
+                    _terminate_lost_instance(inst)
+                continue
+            inst["_container_id"] = container.id
+            inst["_container_name"] = getattr(container, "name", None) or name
+            _vm_apply_container_ip(inst, container, network)
+            try:
+                from ministack.services.imds_linklocal import start_instance_imds_sidecar
+
+                gateway_port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+                start_instance_imds_sidecar(client, container, str(gateway_port), network)
+            except Exception as err:
+                logger.warning("EC2: could not start IMDS sidecar for %s: %s", iid, err)
+            inst["_ssm_managed"] = _probe_shell(container)
+            logger.info("EC2: adopted restored instance %s container %s", iid, name)
 
 
 def _restore_regional_store(store, restored):
@@ -2089,8 +2188,15 @@ def _docker_touched():
     return _docker_in_use or _any_image_registered()
 
 
-def _ec2_container_name(instance_id):
-    return f"ministack-ec2-{get_account_id()}-{get_region()}-{instance_id}"
+def _ec2_container_name(instance_id, account_id=None, region=None):
+    """Stable container name for an instance, including across a reboot.
+
+    Persisted snapshots drop container ids, so the name is the identity a boot
+    sweep uses to recognise a guest that is still owned by a running record.
+    """
+    account_id = account_id or get_account_id()
+    region = region or get_region()
+    return f"ministack-ec2-{account_id}-{region}-{instance_id}"
 
 
 # ── RegisterImage / DeregisterImage ────────────────────────
