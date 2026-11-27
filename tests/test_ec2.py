@@ -4087,6 +4087,7 @@ class _FakeContainer:
         self.status = "running"
         self.attrs = {"NetworkSettings": {"Networks": {network: {"IPAddress": ip}}}}
         self.execs = []
+        self.archives = []
         self.stop_calls = self.start_calls = self.restart_calls = self.remove_calls = 0
         self._registry = registry
         self._shell = shell
@@ -4104,6 +4105,22 @@ class _FakeContainer:
             exit_code = 0
             output = out
         return _R()
+
+    def put_archive(self, path, data):
+        """Record what the module writes into the container's filesystem."""
+        import io
+        import tarfile
+
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            member = tar.getmembers()[0]
+            payload = tar.extractfile(member).read()
+        self.archives.append({
+            "path": path,
+            "name": member.name,
+            "mode": member.mode,
+            "data": payload,
+        })
+        return True
 
     def start(self):
         self.start_calls += 1
@@ -4471,6 +4488,36 @@ def test_ec2_managed_instance_execs(vm):
     assert ec2mod.instance_is_managed(iids[0]) is True
     code, out, err = ec2mod.exec_in_instance_blocking(iids[0], ["/bin/sh", "-c", "true"])
     assert (code, out, err) == (0, "out", "err")
+
+
+def test_ec2_exec_runs_a_shell_script_from_a_file_not_argv(vm):
+    """An SSM script carries secrets; `ps` inside the guest must not show them.
+
+    AWS-RunShellScript arrives as `sh -c <script>`, so the script text (and the
+    exported secrets in it) is the process argv. The module writes it to a 0700
+    file inside the container, runs the file and removes it.
+    """
+    fake, created = vm
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    secret = "guest-secret-7c1f"
+    script = f"export GUEST_TOKEN={secret}\nprintenv GUEST_TOKEN"
+
+    code, out, err = ec2mod.exec_in_instance_blocking(iids[0], ["/bin/sh", "-c", script])
+
+    assert (code, out, err) == (0, "out", "err")
+    container = [c for c in set(fake._registry.values()) if iids[0] in c.name][0]
+    assert all(secret not in " ".join(cmd) for cmd in container.execs)
+    assert all(script not in " ".join(cmd) for cmd in container.execs)
+    assert len(container.archives) == 1
+    entry = container.archives[0]
+    assert entry["path"] == "/tmp"
+    assert entry["mode"] == 0o700
+    assert secret in entry["data"].decode()
+    program = entry["path"].rstrip("/") + "/" + entry["name"]
+    assert ["/bin/sh", program] in container.execs
+    assert ["/bin/rm", "-f", program] in container.execs
 
 
 def test_ec2_exec_on_instance_without_a_box_fails(vm):
