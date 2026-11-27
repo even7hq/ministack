@@ -64,12 +64,15 @@ Supports:
 
 import copy
 import hashlib
+import io
 import logging
 import os
 import random
 import re
 import string
+import tarfile
 import time
+import uuid
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
@@ -2813,6 +2816,39 @@ def instance_is_managed(instance_id):
     return bool(inst.get("_ssm_managed"))
 
 
+def _exec_shell_script(container, script):
+    """Run a shell script that must not appear in the process argv.
+
+    An SSM AWS-RunShellScript invocation arrives as `sh -c <script>`, and the
+    script can carry exported secrets. `ps` inside the guest then shows them,
+    because argv is world-readable. Write the script to a 0700 file in the
+    container, run the file, and remove it afterwards.
+
+    Returns the same object `container.exec_run(argv, demux=True)` returns.
+    """
+    name = f"ministack-exec-{uuid.uuid4().hex}.sh"
+    data = script.encode("utf-8")
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        info = tarfile.TarInfo(name=name)
+        info.size = len(data)
+        info.mode = 0o700
+        tar.addfile(info, io.BytesIO(data))
+    archive.seek(0)
+    container.put_archive("/tmp", archive.read())
+    program = f"/tmp/{name}"
+    try:
+        return container.exec_run(["/bin/sh", program], demux=True)
+    finally:
+        # Fixed argv: the path is random and random is not a secret. Best
+        # effort, because a failed cleanup must not hide the script's result.
+        try:
+            container.exec_run(["/bin/rm", "-f", program], demux=True)
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "could not remove the exec script %s", program)
+
+
 def exec_in_instance_blocking(instance_id, argv):
     inst = _instances.get(instance_id)
     if not inst:
@@ -2820,8 +2856,13 @@ def exec_in_instance_blocking(instance_id, argv):
     container = _vm_get_container(inst)
     if container is None:
         return 255, "", "instance has no backing container"
+    argv = list(argv or [])
     try:
-        result = container.exec_run(argv, demux=True)
+        if (len(argv) == 3 and argv[1] == "-c"
+                and os.path.basename(argv[0]) == "sh"):
+            result = _exec_shell_script(container, argv[2])
+        else:
+            result = container.exec_run(argv, demux=True)
     except Exception as e:
         return 255, "", str(e)
     stdout, stderr = (result.output if isinstance(result.output, tuple) else (result.output, None))
