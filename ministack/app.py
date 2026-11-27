@@ -3390,10 +3390,11 @@ async def _handle_lifespan(scope, receive, send):
 
                 install_docker_hub_fallback()
             _run_init_scripts()
-            # Reap any container that survived a hard kill of the previous
-            # process. Persistence strips container ids from snapshots, so any
-            # ministack-labelled container alive at boot is by definition an
-            # orphan whose name will collide on next create.
+            # Reap containers that survived a hard kill of the previous process.
+            # With PERSIST_STATE=1 a running EC2 guest is NOT an orphan: its
+            # container id is stripped from the snapshot, but its name is derived
+            # from the persisted instance id, so it can be protected and adopted
+            # once persistence loads. Real orphans are still swept here.
             #
             # Bounded: the sweep normally finishes in well under a second and we
             # wait for it, so a create right after boot still sees a clean slate.
@@ -3409,7 +3410,10 @@ async def _handle_lifespan(scope, receive, send):
             # predates the instance labels. Holding the gateway port means any
             # such container is ours. Shutdown deliberately does not do this —
             # another instance may be live on this daemon.
-            _reap = spawn_background(_stop_docker_containers, True, thread_name="ministack-boot-reap")
+            _reap = spawn_background(
+                _stop_docker_containers, True, _boot_protected_container_refs(),
+                thread_name="ministack-boot-reap",
+            )
             _reap.join(timeout=_DOCKER_REAP_BOOT_DEADLINE)
             if _reap.is_alive():
                 logger.warning(
@@ -3565,7 +3569,24 @@ def _reaper_docker_client():
         return None
 
 
-def _stop_docker_containers(include_unlabelled: bool = False):
+def _boot_protected_container_refs():
+    """Container refs still owned by persisted instances, or an empty set.
+
+    Reading the snapshot is cheap and must never stop the gateway from binding:
+    any problem here only means the old, conservative boot sweep runs.
+    """
+    if not PERSIST_STATE or not _docker_socket_present():
+        return set()
+    try:
+        from ministack.services import ec2
+
+        return ec2.boot_protected_container_refs()
+    except Exception as exc:
+        logger.warning("Could not read persisted container owners at boot: %s", exc)
+        return set()
+
+
+def _stop_docker_containers(include_unlabelled: bool = False, protected=()):
     """Remove every MiniStack container. Boot and shutdown only.
 
     The reclamation rules live in ``core.container_reaper``: this is the
@@ -3581,7 +3602,7 @@ def _stop_docker_containers(include_unlabelled: bool = False):
     client = _reaper_docker_client()
     if client is None:
         return
-    container_reaper.reap_all(client, include_unlabelled=include_unlabelled)
+    container_reaper.reap_all(client, include_unlabelled=include_unlabelled, protected=protected)
 
 
 def _build_persistence_save_dict():
