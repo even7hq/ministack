@@ -1,6 +1,8 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
-"""Boot must not kill running EC2 guests that a persisted record still owns."""
+"""Boot and shutdown must not kill EC2 guests a persisted record still owns."""
+
+import asyncio
 
 import pytest
 
@@ -111,3 +113,43 @@ def test_boot_relaunches_missing_guest_with_the_same_bind_mounts(
         assert name in fake_docker.live()
         assert (guest_root / "kevin-ai-agent" / "home").is_dir()
         assert (guest_root / "kevin-ai-agent" / "data").is_dir()
+
+
+@pytest.mark.serial
+def test_graceful_shutdown_keeps_persisted_guest_containers(monkeypatch):
+    """`docker compose restart` is a process boundary, not a teardown.
+
+    On 2026-11-27 the shutdown path swept every MiniStack container with no
+    protected refs, so the boot-time adoption fix had nothing to adopt: the
+    guest was relaunched from its image and lost the start hooks, NetBird and
+    the Hub supervisor installed in its container layer.
+    """
+    from ministack.services import imds_linklocal, transfer
+
+    refs = {"ministack-ec2-persisted-guest"}
+    calls = []
+    monkeypatch.setattr(app, "PERSIST_STATE", True)
+    monkeypatch.setattr(app, "save_all", lambda *_: None)
+    monkeypatch.setattr(app, "_boot_protected_container_refs", lambda: refs)
+    monkeypatch.setattr(app, "_stop_docker_containers", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(app, "_iot_mtls_task", None)
+    monkeypatch.setattr(transfer, "sftp_stop", _async_noop)
+    monkeypatch.setattr(imds_linklocal, "stop_link_local_imds", lambda: None)
+
+    messages = iter([{"type": "lifespan.shutdown"}])
+    sent = []
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app._handle_lifespan({}, receive, send))
+
+    assert calls == [{"protected": refs}]
+    assert {"type": "lifespan.shutdown.complete"} in sent
+
+
+async def _async_noop():
+    return None

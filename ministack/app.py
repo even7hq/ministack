@@ -3538,7 +3538,15 @@ async def _handle_lifespan(scope, receive, send):
                 stop_link_local_imds()
             except Exception as e:
                 logger.debug("IMDS link-local shutdown error: %s", e)
-            _stop_docker_containers()
+            # A graceful restart is a process boundary, not a teardown: with
+            # persistence on, a running guest is still a live resource and its
+            # container must survive so boot can adopt it. Sweeping it here
+            # makes the boot-time adoption fix useless -- there is nothing left
+            # to adopt, so the guest is relaunched from the image and every
+            # start hook installed in its container layer is lost.
+            _stop_docker_containers(
+                protected=_boot_protected_container_refs() if PERSIST_STATE else ()
+            )
             await send({"type": "lifespan.shutdown.complete"})
             return
 
