@@ -226,11 +226,12 @@ def reap_all(docker_client, stop_timeout: int = 2, include_unlabelled: bool = Fa
     record still owns it: we hold the gateway port now, so whichever process
     created them is gone, but with ``PERSIST_STATE=1`` a running EC2 guest is
     still a live resource whose container id was stripped from the snapshot.
-    Boot therefore passes ``protected`` — container ids and names read back from
-    persisted state — so adoption can reattach those guests. At shutdown
-    everything is going away regardless. Neither assumption holds while the
-    process is live, which is why :func:`reap_abandoned` exists separately
-    and is far more conservative.
+    Boot and graceful shutdown are both process boundaries for a persisted
+    guest, so both pass ``protected`` — container ids and names read back from
+    persisted state — so adoption can reattach those guests after a restart.
+    A shutdown of an ephemeral instance has no persisted owner and is still
+    swept. Neither assumption holds while the process is live, which is why
+    :func:`reap_abandoned` exists separately and is far more conservative.
 
     Scoped by ``ministack.instance`` but *not* by boot nonce — the whole point is
     to reclaim a previous run's containers, which carry a different nonce.
